@@ -1,6 +1,10 @@
 package com.companion.chat.ui.chat
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.widget.Toast
 import java.io.File
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -8,6 +12,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -27,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
@@ -38,6 +44,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.companion.chat.R
+import com.companion.chat.data.image.HeicToJpeg
+import com.companion.chat.data.image.readFileHead
+import com.companion.chat.data.remote.ImageFormats
 import com.companion.chat.data.speech.SttManager
 import com.companion.chat.ui.permission.RecordPermission
 import com.companion.chat.ui.permission.rememberLocationPermission
@@ -45,6 +54,7 @@ import com.companion.chat.ui.permission.rememberRecordPermission
 import com.companion.chat.ui.speech.VoiceInputController
 import com.companion.chat.ui.speech.VoiceInputOverlay
 import com.companion.chat.ui.speech.VoiceState
+import com.companion.chat.ui.theme.LocalChatColors
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -81,10 +91,19 @@ fun ChatScreen(
     /** V2.3.6：通知栏语音识别结果，非空时回填输入框（只填不发送）。 */
     voicePending: String? = null,
     onVoicePendingConsumed: () -> Unit = {},
+    /** 流式输出中：撤回 / 重新生成 一律禁用（会和正在写入的临时消息打架）。 */
+    isStreaming: Boolean = false,
+    /** 撤回：删除这条 user 消息**及其之后的全部消息**（含紧随的 AI 回答）。 */
+    onTruncateFrom: (Long) -> Unit = {},
+    /** 重新生成：删掉最后一条 AI 回答重新问一遍。 */
+    onRegenerate: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     var messageInput by remember { mutableStateOf("") }
+
+    // 撤回不可恢复 → 必须二次确认；这里只暂存"待撤回的那条"，确认后才真正删
+    var pendingRecall by remember { mutableStateOf<MessageUiModel?>(null) }
 
     // V2.3.6：通知栏语音结果只回填输入框，绝不自动发送；回填后立即通知 ViewModel 清空标记
     LaunchedEffect(voicePending) {
@@ -195,15 +214,39 @@ fun ChatScreen(
     }
 
     // 相册多选（≤ MAX_IMAGES）
+    // 加固 A（V1.6.2.6）：选完先验一遍类型。**只要有任意一个不是可发送的图片，整批拒绝**，
+    // 并弹内嵌赞助码的对话框——把"莫名其妙的失败"换成一句有人话的解释。
+    var showUnsupportedDialog by remember { mutableStateOf(false) }
     val pickImages = rememberLauncherForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris ->
         if (uris.isNotEmpty()) {
-            val remain = (MAX_IMAGES - selectedUris.size).coerceAtLeast(0)
-            if (uris.size > remain) {
-                Toast.makeText(context, "最多 $MAX_IMAGES 张，已截断", Toast.LENGTH_SHORT).show()
+            if (uris.all { isSendableImageUri(context, it) }) {
+                val remain = (MAX_IMAGES - selectedUris.size).coerceAtLeast(0)
+                if (uris.size > remain) {
+                    Toast.makeText(context, "最多 $MAX_IMAGES 张，已截断", Toast.LENGTH_SHORT).show()
+                }
+                selectedUris.addAll(uris.take(remain))
+            } else {
+                showUnsupportedDialog = true
             }
-            selectedUris.addAll(uris.take(remain))
+        }
+    }
+
+    // 加固 B：点发送**不立刻清空**，等这条消息真的出现在列表里（说明读图/持久化都过了）再清。
+    // 原先是乐观清空：一旦发送失败（图太大、格式不认、Uri 失效），字和图全没了，只剩一个 Toast。
+    var pendingSentText by remember { mutableStateOf<String?>(null) }
+    var pendingBaseMaxId by remember { mutableStateOf(0L) }
+    LaunchedEffect(messages.size, messages.lastOrNull()?.id) {
+        val pending = pendingSentText ?: return@LaunchedEffect
+        val landed = messages.any {
+            it.isUser && it.id > pendingBaseMaxId && it.content.trim() == pending.trim()
+        }
+        if (landed) {
+            // 发送期间用户可能又打了新内容：只在没改动时清空，别把新打的字吃掉
+            if (messageInput.trim() == pending.trim()) messageInput = ""
+            selectedUris.clear()
+            pendingSentText = null
         }
     }
 
@@ -267,9 +310,10 @@ fun ChatScreen(
                     onRemoveImage = { selectedUris.remove(it) },
                     onSend = {
                         if (messageInput.isNotBlank() || selectedUris.isNotEmpty()) {
+                            // 加固 B：只登记"这一轮发的是什么"，清空交给上面的 LaunchedEffect
+                            pendingSentText = messageInput
+                            pendingBaseMaxId = messages.maxOfOrNull { it.id } ?: 0L
                             onSendMessage(messageInput, selectedUris.toList())
-                            messageInput = ""
-                            selectedUris.clear()
                         }
                     },
                     onVoiceClick = onVoiceClick,
@@ -288,7 +332,15 @@ fun ChatScreen(
             if (messages.isEmpty()) {
                 EmptyState()
             } else {
-                MessageList(messages = messages, listState = listState, onReadAloud = onReadAloud, speakingId = speakingId)
+                MessageList(
+                    messages = messages,
+                    listState = listState,
+                    onReadAloud = onReadAloud,
+                    speakingId = speakingId,
+                    actionsEnabled = !isStreaming,
+                    onRecall = { pendingRecall = it },
+                    onRegenerate = onRegenerate
+                )
             }
 
             // V2.3.4 录音/识别浮层。state 用 lambda 取，采样只在浮层内部触发重组，
@@ -301,6 +353,59 @@ fun ChatScreen(
                 )
             }
         }
+    }
+
+    // ---- 撤回二次确认（不可恢复）----
+    pendingRecall?.let { target ->
+        val startIndex = messages.indexOfFirst { it.id == target.id }
+        val count = if (startIndex >= 0) messages.size - startIndex else 1
+        AlertDialog(
+            onDismissRequest = { pendingRecall = null },
+            title = { Text("撤回这条消息？") },
+            text = { Text("撤回后，这条消息及之后的 $count 条消息将被删除，且无法恢复。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingRecall = null
+                    onTruncateFrom(target.id)
+                }) {
+                    Text("撤回", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRecall = null }) { Text("取消") }
+            }
+        )
+    }
+
+    // ---- 选了非图片文件：整批拒绝 + 内嵌赞助码（加固 A / V1.6.2.6）----
+    // 放在 ChatScreen 顶层而不是 InputBar 里：输入栏每次重组（打字、波形刷新）都不会把弹窗状态带掉。
+    if (showUnsupportedDialog) {
+        AlertDialog(
+            onDismissRequest = { showUnsupportedDialog = false },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        "目前仅支持图片，赞助我一杯奶茶钱，催我更新",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Image(
+                        painter = painterResource(id = R.drawable.img_footer),
+                        contentDescription = "赞助收款码",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxWidth(0.72f)
+                            .clip(RoundedCornerShape(12.dp))
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showUnsupportedDialog = false }) { Text("知道了") }
+            }
+        )
     }
 }
 
@@ -327,15 +432,18 @@ private fun TopBar(
             }
         },
         actions = {
-            TextButton(onClick = onMemoryClick) {
-                Text("记忆", fontSize = 16.sp)
+            // 1.8.0：原来是「记忆」文字按钮，改成描线大脑图标（用户指定 🧠）。
+            // 用 Icons.Default.Psychology（单色，跟旁边勿扰/新建同色同尺寸），
+            // 不用彩色 emoji —— 顶栏其它图标都是单色描线，混一个彩色 emoji 会很跳。
+            IconButton(onClick = onMemoryClick) {
+                Icon(imageVector = Icons.Default.Psychology, contentDescription = "记忆")
             }
             IconButton(onClick = onDndClick) {
                 // 开启状态必须**看得出**差别：只换 contentDescription 等于还是「点了没反应」。
                 // extended 图标已在依赖里（`filled.*` 通配导入），NotificationsOff 无需新增 import。
                 Icon(
                     imageVector = if (dndEnabled) Icons.Default.NotificationsOff else Icons.Default.Notifications,
-                    tint = if (dndEnabled) MaterialTheme.colorScheme.primary else LocalContentColor.current,
+                    tint = if (dndEnabled) LocalChatColors.current.accentFill else LocalContentColor.current,
                     contentDescription = if (dndEnabled) "勿扰已开启，点按关闭" else "勿扰已关闭，点按开启"
                 )
             }
@@ -356,8 +464,14 @@ private fun EmptyState() {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
+        // 1.9.2：图标按深浅各一张，互不通用 ——
+        //   深色：ic_whale.png = 384×384 黑底圆角卡片 + 白鲸（黑底上只剩白色轮廓）
+        //   浅色：ic_whale_light.png = 透明底 + 黑色墨迹鲸鱼（白底上只剩墨迹，卡片的白色本来就看不见）
+        // 不能只用一张反色：反色会把卡片也翻成一块黑的。
         Image(
-            painter = painterResource(id = R.drawable.ic_whale),
+            painter = painterResource(
+                id = if (isSystemInDarkTheme()) R.drawable.ic_whale else R.drawable.ic_whale_light
+            ),
             contentDescription = "DeepSpeak",
             modifier = Modifier.size(96.dp)
         )
@@ -376,15 +490,28 @@ private fun MessageList(
     messages: List<MessageUiModel>,
     listState: androidx.compose.foundation.lazy.LazyListState,
     onReadAloud: (Long, String) -> Unit,
-    speakingId: Long?
+    speakingId: Long?,
+    actionsEnabled: Boolean,
+    onRecall: (MessageUiModel) -> Unit,
+    onRegenerate: () -> Unit
 ) {
+    val lastId = messages.lastOrNull()?.id
     LazyColumn(
         state = listState,
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         items(messages) { message ->
-            MessageBubble(message = message, onReadAloud = onReadAloud, speakingId = speakingId)
+            MessageBubble(
+                message = message,
+                onReadAloud = onReadAloud,
+                speakingId = speakingId,
+                actionsEnabled = actionsEnabled,
+                // 只有最后一条 assistant 消息能「重新生成」，否则后面的对话会变成孤儿
+                canRegenerate = message.id == lastId && !message.isUser,
+                onRecall = { onRecall(message) },
+                onRegenerate = onRegenerate
+            )
         }
     }
 }
@@ -393,19 +520,27 @@ private fun MessageList(
 private fun MessageBubble(
     message: MessageUiModel,
     onReadAloud: (Long, String) -> Unit,
-    speakingId: Long?
+    speakingId: Long?,
+    actionsEnabled: Boolean,
+    canRegenerate: Boolean,
+    onRecall: () -> Unit,
+    onRegenerate: () -> Unit
 ) {
+    val context = LocalContext.current
+    // 气泡/图形色走「色板」：深浅两套，由 Theme 一次选好，这里不判断深浅。
+    val palette = LocalChatColors.current
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (message.isUser) Arrangement.End else Arrangement.Start
     ) {
         Card(
+            // 1.8.0：不再用 primaryContainer / secondaryContainer（壁纸动态取色的色，且
+            // 「用户=蓝、AI=灰」的强对比块）。改走色板：用户 #333333/深、AI 与背景同色（方案 A）。
+            // 结构 / 留白 / 280dp 宽度上限 / 操作行全部保留。contentColor 必须显式给，
+            // 自定义 containerColor 不在配色表里，Compose 推不出对比色会退回 LocalContentColor。
             colors = CardDefaults.cardColors(
-                containerColor = if (message.isUser) {
-                    MaterialTheme.colorScheme.primaryContainer
-                } else {
-                    MaterialTheme.colorScheme.secondaryContainer
-                }
+                containerColor = if (message.isUser) palette.bubbleUser else palette.bubbleAi,
+                contentColor = if (message.isUser) palette.bubbleUserText else palette.bubbleAiText
             ),
             modifier = Modifier.widthIn(max = 280.dp)
         ) {
@@ -430,24 +565,95 @@ private fun MessageBubble(
                         fontSize = 16.sp
                     )
                 }
-                // 朗读按钮（任务 4.2）：仅已完成的 assistant 消息（流式临时消息 id<0 不显示）
-                if (!message.isUser && message.content.isNotBlank() && message.id > 0) {
-                    val playing = speakingId == message.id
-                    IconButton(
-                        onClick = { onReadAloud(message.id, message.content) },
-                        modifier = Modifier
-                            .align(Alignment.End)
-                            .size(28.dp)
+
+                // ---- 常驻操作行：复制 / 撤回|重新生成 / 朗读 ----
+                // 流式临时消息（id<0）不显示任何按钮：它还没落库，点了也删不到。
+                // 注意：这里**不能**用 fillMaxWidth / weight —— 气泡宽度是自适应的（widthIn max 280），
+                // 一旦子项 fillMaxWidth，所有气泡都会被撑满 280dp，短消息"你好"也会变成一条超宽块。
+                if (message.id > 0 && (message.content.isNotBlank() || !message.isUser)) {
+                    Row(
+                        modifier = Modifier.padding(start = 2.dp, end = 2.dp, top = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            imageVector = if (playing) Icons.Default.Stop else Icons.Default.VolumeUp,
-                            contentDescription = if (playing) "停止朗读" else "朗读",
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(18.dp)
-                        )
+                        if (message.content.isNotBlank()) {
+                            MessageActionButton(
+                                icon = Icons.Default.ContentCopy,
+                                label = "复制",
+                                onClick = { copyMessage(context, message.content) }
+                            )
+                        }
+                        if (message.isUser) {
+                            // user 消息：撤回（删除这条及之后全部）
+                            MessageActionButton(
+                                icon = Icons.Default.Delete,
+                                label = "撤回",
+                                enabled = actionsEnabled,
+                                tint = MaterialTheme.colorScheme.error,
+                                onClick = onRecall
+                            )
+                        } else if (canRegenerate) {
+                            // AI 消息：重新生成（图标与撤回区分开：循环箭头 vs 垃圾桶）
+                            MessageActionButton(
+                                icon = Icons.Default.Refresh,
+                                label = "重新生成",
+                                enabled = actionsEnabled,
+                                onClick = onRegenerate
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(2.dp))
+                        if (!message.isUser && message.content.isNotBlank()) {
+                            val playing = speakingId == message.id
+                            IconButton(
+                                onClick = { onReadAloud(message.id, message.content) },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (playing) Icons.Default.Stop else Icons.Default.VolumeUp,
+                                    contentDescription = if (playing) "停止朗读" else "朗读",
+                                    tint = LocalChatColors.current.accentFill,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
                     }
                 }
             }
+        }
+    }
+}
+
+/** 气泡里的 18dp 小图标按钮（复制 / 撤回 / 重新生成），点按区域 34dp。 */
+@Composable
+private fun MessageActionButton(
+    icon: ImageVector,
+    label: String,
+    enabled: Boolean = true,
+    tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .clip(CircleShape)
+            .then(if (enabled) Modifier.clickable(onClick = onClick) else Modifier),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = if (enabled) tint else tint.copy(alpha = 0.35f),
+            modifier = Modifier.size(18.dp)
+        )
+    }
+}
+
+/** 复制到系统剪贴板。Android 13+ 系统会自己弹「已复制」浮层，这里就不再 Toast 重复提示。 */
+private fun copyMessage(context: Context, text: String) {
+    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+    runCatching {
+        cm.setPrimaryClip(ClipData.newPlainText("DeepSpeak", text))
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
         }
     }
 }
@@ -469,6 +675,8 @@ private fun InputBar(
     val canSend = message.isNotBlank() || selectedUris.isNotEmpty()
     // 中性灰面板（不跟随动态取色的紫色），亮/暗主题都能用
     val fieldColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)
+    // 发送键/光标的 accent 走色板（深=#7797EC / 浅=#467CF6）
+    val palette = LocalChatColors.current
 
     Surface(
         shape = RoundedCornerShape(22.dp),
@@ -508,7 +716,7 @@ private fun InputBar(
                     fontSize = 16.sp,
                     color = MaterialTheme.colorScheme.onSurface
                 ),
-                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                cursorBrush = SolidColor(LocalChatColors.current.accentFill),
                 maxLines = 6,
                 decorationBox = { innerTextField ->
                     Box(modifier = Modifier.fillMaxWidth()) {
@@ -542,36 +750,47 @@ private fun InputBar(
 
                 Spacer(modifier = Modifier.weight(1f))
 
-                // 空态显示麦克风；有内容时换成发送键（与 DeepSeek 手机端一致）
-                if (canSend) {
-                    Box(
-                        modifier = Modifier
-                            .size(34.dp)
-                            .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.primary)
-                            .clickable(onClick = onSend),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.ArrowUpward,
-                            contentDescription = "发送",
-                            modifier = Modifier.size(20.dp),
-                            tint = MaterialTheme.colorScheme.onPrimary
-                        )
-                    }
-                } else if (sttEnabled) {
-                    // V2.3.5：语音输入关掉时这里整块不渲染；左侧「+」仍是 Row 的起点，布局不塌
+                // 输入栏改版（2026-11-21）：麦克风与发送键**常驻并排**，不再「有字才冒出发送键」。
+                // 空输入时发送键置灰且不挂 click（点了无反应，不弹 Toast）。
+                if (sttEnabled) {
                     RoundIconButton(
                         onClick = if (voiceGesture == null) onVoiceClick else null,
                         modifier = voiceGesture ?: Modifier
                     ) {
                         Icon(
-                            imageVector = Icons.Default.KeyboardVoice,
+                            imageVector = Icons.Default.Mic,
                             contentDescription = if (voiceGesture == null) "语音" else "按住说话",
                             modifier = Modifier.size(20.dp),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+                    Spacer(modifier = Modifier.width(10.dp))
+                }
+                Box(
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (canSend) {
+                                // 1.9.0：图形填充走色板 accentFill（深=#7797EC / 浅=#467CF6）
+                                palette.accentFill
+                            } else {
+                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                            }
+                        )
+                        .then(if (canSend) Modifier.clickable(onClick = onSend) else Modifier),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ArrowUpward,
+                        contentDescription = if (canSend) "发送" else "发送（尚未输入内容）",
+                        modifier = Modifier.size(20.dp),
+                        tint = if (canSend) {
+                            MaterialTheme.colorScheme.onPrimary
+                        } else {
+                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                        }
+                    )
                 }
             }
         }
@@ -659,3 +878,27 @@ data class MessageUiModel(
     /** 该消息附带的本地图片文件路径（多图），气泡据此渲染图片 */
     val imagePaths: List<String> = emptyList()
 )
+
+/**
+ * 加固 A（V1.6.2.6）：一个 MIME + 一段文件头，能不能当图片发出去。
+ *
+ * 纯函数，可以 JVM 单测；真正读文件的那一步在 [isSendableImageUri]。
+ *
+ * 判据三条，顺序有讲究：
+ * 1. **HEIC/HEIF 算"能发"** —— data 层会自动转 JPEG（V1.6.2.5），这里拦住等于把刚修好的功能又关掉；
+ * 2. MIME 在白名单里 → 放行（绝大多数相册图片走这条，零额外读盘）；
+ * 3. MIME 不可信时只看头：`ImageFormats.detect` 认 jpeg/png/gif/webp 的魔数。
+ */
+internal fun isSendableImagePick(mime: String?, head: ByteArray?): Boolean {
+    if (HeicToJpeg.looksLikeHeic(head, mime)) return true
+    if (mime != null && mime in ImageFormats.SUPPORTED) return true
+    val detected = head?.let { ImageFormats.detect(it) } ?: return false
+    return detected in ImageFormats.SUPPORTED
+}
+
+/** 读 MIME + 前 16 字节交给 [isSendableImagePick]。只读头，不加载整张图。 */
+private fun isSendableImageUri(context: Context, uri: Uri): Boolean {
+    val mime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+    val head = readFileHead(context, uri)
+    return isSendableImagePick(mime, head)
+}

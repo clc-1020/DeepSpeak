@@ -354,7 +354,11 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
                     speakingId = state.speakingId,
                     // V2.3.6：通知栏语音结果回填输入框（只填不发送）
                     voicePending = state.voicePending,
-                    onVoicePendingConsumed = { vm.voicePendingConsumed() }
+                    onVoicePendingConsumed = { vm.voicePendingConsumed() },
+                    // 消息操作：流式中禁用；撤回=截断到这条；重新生成=重问最后一条
+                    isStreaming = state.isStreaming,
+                    onTruncateFrom = { id -> vm.truncateFrom(id) },
+                    onRegenerate = { vm.regenerateLast() }
                 )
             }
         }

@@ -3,14 +3,19 @@ package com.companion.chat.ui.settings
 import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -37,6 +42,7 @@ import com.companion.chat.domain.power.KeepAliveTarget
 import com.companion.chat.domain.proactive.ProactiveGateRules
 import com.companion.chat.domain.settings.EnvironmentSettings
 import com.companion.chat.ui.permission.rememberLocationPermission
+import com.companion.chat.ui.theme.LocalChatColors
 import kotlinx.coroutines.launch
 
 /** 设置表单数据。任务 1.5（设置页 = 1.5 人设 + 7.1 部分） */
@@ -144,6 +150,10 @@ fun SettingsScreen(
     var showNeedRootDialog by remember { mutableStateOf(false) }
     // 日志对话框开关独立于 keepAliveState：关掉对话框后状态要保留，否则日志就没了
     var showLogDialog by remember { mutableStateOf(false) }
+    // 1.7.0：人设默认收起。人设提示词通常是几百字的大段文本，常驻展开会让整页显得臃肿。
+    // 用 rememberSaveable 而不是 remember：转到后台再回来不该弹回展开态（离开设置页整棵树会销毁，
+    // 所以这里只保证"本次停留"内记住，不跨会话 —— 跨会话记忆要动 ConfigRepository，属逻辑线范围）。
+    var personaExpanded by rememberSaveable { mutableStateOf(false) }
     // V2.1.1：粗定位权限状态（设置页只提供按钮，进页面不自动弹）
     val locationPermission = rememberLocationPermission(autoRequestOnce = false)
 
@@ -187,7 +197,17 @@ fun SettingsScreen(
                     IconButton(onClick = onBack) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "返回")
                     }
-                }
+                },
+                // 1.7.0：保存移到顶栏右上角 —— 顶栏不随滚动移动，页面再长也不用滚到底才存。
+                // 行为与原来完全一致：走 onSave（落盘 → Toast「已保存」→ 回聊天页）。
+                actions = {
+                    TextButton(onClick = { onSave(form) }) { Text("保存") }
+                },
+                // 1.8.0：显式钉住顶栏底色 —— 深色模式下 surface 就是 #0F0F0F，
+                // 与聊天区同色、"一片黑"（用户要求）。不写死 hex，仍走配色表。
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.surface
+                )
             )
         }
     ) { padding ->
@@ -199,6 +219,19 @@ fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            // 1.7.0：「她的状态」从「主动消息」区提到页面最顶。
+            // 这 5 项是只读展示、但常看（一眼知道她现在怎么样），做成一张紧凑卡片，
+            // 不再用 6 段独立 Text 撑成"一排免责声明"。
+            StatusCard(
+                currentMood = currentMood,
+                currentMoodReason = currentMoodReason,
+                relationshipText = relationshipText,
+                warmthText = warmthText,
+                emotionSummary = emotionSummary,
+                onRefresh = onRefreshPermissions
+            )
+
+            Spacer(Modifier.height(4.dp))
             Text("模型与服务商", style = MaterialTheme.typography.titleMedium)
 
             DropdownField(
@@ -378,41 +411,6 @@ fun SettingsScreen(
                     steps = 9
                 )
             }
-            Text(
-                "当前心情：${MoodTone.label(currentMood)}（影响主动消息语气）",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                "你们的关系：$relationshipText（决定她能不能撒娇）",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                "当前热络度：$warmthText",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                "备注：关系 = 你们聊了多久、能不能撒娇（只升不降）；" +
-                    "热络度 = 最近聊得勤不勤（久不聊会变淡，但关系不会退）。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.outline
-            )
-            Text(
-                "她的情绪：$emotionSummary",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            if (currentMoodReason.isNotBlank()) {
-                // 理由比标签有用：标签只有「平常/心情不错/有点低落」三档，理由能看出模型是怎么判的。
-                Text(
-                    "判定理由：$currentMoodReason（每 5 轮对话更新一次）",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-
             SwitchRow("主动消息自动语音（通知弹出后后台念）", form.proactiveVoiceEnabled) {
                 form = form.copy(proactiveVoiceEnabled = it)
             }
@@ -550,20 +548,50 @@ fun SettingsScreen(
             }
 
             Spacer(Modifier.height(8.dp))
-            Text("人设", style = MaterialTheme.typography.titleMedium)
-
-            OutlinedTextField(
-                value = form.persona,
-                onValueChange = { form = form.copy(persona = it) },
-                label = { Text("人设提示词（性格 / 说话风格 / 称呼）") },
-                minLines = 4,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Text(
-                "示例：你叫小陪，是我温柔体贴的女朋友。说话口语化、偶尔撒娇，用「宝宝」称呼我。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            // 1.7.0：人设折叠。这段提示词通常几百字，常驻展开会让一个大输入框吃掉小半屏。
+            // 收起时只留标题 + 字数摘要。只响应「点标题」，刻意不做失焦自动收起 ——
+            // OutlinedTextField 离开组合会丢光标位置和内部滚动，那等于打断输入。
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { personaExpanded = !personaExpanded }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "人设",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Icon(
+                        if (personaExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = if (personaExpanded) "收起人设" else "展开人设",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                if (!personaExpanded) {
+                    Text(
+                        if (form.persona.isBlank()) "未设置（用默认人设）· 点标题展开"
+                        else "已自定义 ${form.persona.length} 字 · 点标题展开",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = form.persona,
+                        onValueChange = { form = form.copy(persona = it) },
+                        label = { Text("人设提示词（性格 / 说话风格 / 称呼）") },
+                        minLines = 4,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        "示例：你叫小陪，是我温柔体贴的女朋友。说话口语化、偶尔撒娇，用「宝宝」称呼我。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
 
             Spacer(Modifier.height(8.dp))
             Text("主动消息测试", style = MaterialTheme.typography.titleMedium)
@@ -714,13 +742,7 @@ fun SettingsScreen(
                 )
             }
 
-            Spacer(Modifier.height(8.dp))
-            Button(
-                onClick = { onSave(form) },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("保存")
-            }
+            // 1.7.0：底部「保存」已移到顶栏右上角，这里不再有保存按钮 —— 页面滚到底就是赞助码。
             Spacer(Modifier.height(16.dp))
         }
 
@@ -830,7 +852,16 @@ private fun SwitchRow(label: String, checked: Boolean, onCheckedChange: (Boolean
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
         Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        // 1.9.0：开关轨道走色板 accentFill（深=#7797EC / 浅=#467CF6），
+        // 不用 primary —— 浅色的 primary 是文字那个更深的蓝 (#2F63D8)，开关要品牌亮蓝。
+        // 滑块保持 onPrimary（深=#0F0F0F / 浅=#FFFFFF），不显式指定。
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedTrackColor = LocalChatColors.current.accentFill
+            )
+        )
     }
 }
 
@@ -856,5 +887,102 @@ private fun PermissionRow(
         if (!granted) {
             OutlinedButton(onClick = onClick) { Text(actionLabel) }
         }
+    }
+}
+
+/**
+ * 1.7.0：「她的状态」紧凑卡片（页面最顶）。
+ *
+ * 这 5 项全是只读展示（心情 / 关系 / 热络度 / 情绪 / 判定理由），原来是 6 段独立 Text
+ * 靠 12dp 间距平铺，视觉上像一排免责声明。改成 label 固定宽 + value 占满的左右两列，
+ * 一眼能看出「这是信息块，不是开关区」。
+ *
+ * 为什么给一个 ↻：这些值由 MainActivity 的 `LaunchedEffect(permTick)` 读，只在进页面时读一次，
+ * 所以待久了看到的是几十前分钟的数据。刷新复用的就是现成的 `onRefreshPermissions`（permTick++）。
+ */
+@Composable
+private fun StatusCard(
+    currentMood: String,
+    currentMoodReason: String,
+    relationshipText: String,
+    warmthText: String,
+    emotionSummary: String,
+    onRefresh: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "她的状态",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f)
+                )
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clickable(onClick = onRefresh),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = "刷新她的状态",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+            StatusLine("当前心情", MoodTone.label(currentMood) + "（影响主动消息语气）")
+            StatusLine("你们的关系", relationshipText + "（决定她能不能撒娇）")
+            StatusLine("当前热络度", warmthText)
+            StatusLine("她的情绪", emotionSummary)
+            if (currentMoodReason.isNotBlank()) {
+                // 空串 = 还没跑过判定，整行不占位（与原行为一致）
+                StatusLine("判定理由", currentMoodReason + "（每 5 轮对话更新一次）")
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+            )
+            Text(
+                "关系 = 你们聊了多久、能不能撒娇（只升不降）；" +
+                    "热络度 = 最近聊得勤不勤（久不聊会变淡，但关系不会退）。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline
+            )
+        }
+    }
+}
+
+/** 卡片里的一行：label 固定 80dp 灰小字，value 占满剩余宽度（长了自动换行）。 */
+@Composable
+private fun StatusLine(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            label,
+            modifier = Modifier.width(80.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            value,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface
+        )
     }
 }

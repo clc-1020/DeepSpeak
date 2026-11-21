@@ -19,6 +19,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.companion.chat.data.local.entity.MemoryDailyEntity
 import com.companion.chat.data.local.entity.MemoryLongEntity
 import com.companion.chat.data.local.entity.MemoryShortEntity
+import com.companion.chat.ui.theme.LocalChatColors
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -58,17 +59,29 @@ fun MemoryScreen(
                     IconButton(onClick = onBack) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "返回")
                     }
-                }
+                },
+                // 1.8.0：顶栏与聊天区同色（深色下 = #0F0F0F），保持"一片黑"
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.surface
+                )
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = {
-                when (tab) {
-                    0 -> showShortAdd = true
-                    1 -> showLongAdd = true
-                    else -> showDailyAdd = true
-                }
-            }) {
+            // 1.8.2：默认 primaryContainer（深紫圆钮）→ accent 暗铺底 + accent 图标（方案 B）。
+            // 一整颗 #7797EC 亮蓝在纯黑页面上太抢眼，暗铺底更像"操作位"而不是"警报灯"。
+            // 1.9.0：改走色板，浅色自动换成 #E8EFFE 底 + #2F63D8 图标。
+            val palette = LocalChatColors.current
+            FloatingActionButton(
+                onClick = {
+                    when (tab) {
+                        0 -> showShortAdd = true
+                        1 -> showLongAdd = true
+                        else -> showDailyAdd = true
+                    }
+                },
+                containerColor = palette.accentSurface,
+                contentColor = palette.accentText
+            ) {
                 Icon(Icons.Default.Add, contentDescription = "新增")
             }
         }

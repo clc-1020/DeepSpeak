@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.io.IOException
 import java.net.UnknownHostException
 
@@ -96,6 +97,71 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val convId = conversationId ?: return
         if (_uiState.value.isStreaming) return
         viewModelScope.launch { withContext(Dispatchers.IO) { generateAssistant(convId, emptyList()) } }
+    }
+
+    /**
+     * 撤回：删除 [messageId] 这条消息**及其之后的全部消息**（含紧随其后的 AI 回答），不可恢复。
+     *
+     * 只在用户消息上提供（AI 回答给的是「重新生成」）。实现要点：
+     * - 消息列表不是 Flow 驱动的（见 [loadConversationIntoUi]），删完必须手动回填一次；
+     * - user 消息可能带图，DB 行删掉后要把私有目录里的图片文件一起清掉，否则是孤儿文件；
+     * - 若删掉的区间里包含正在朗读的那条，先停止朗读，否则会继续念一段已经不存在的内容。
+     * - **[不] 动记忆库**：记忆是全库共享、且只有"事件时间"、没有来源消息 id，
+     *   无法把某段对话对应的记忆精确摘出来（详见项目规则），所以撤回只清对话。
+     */
+    fun truncateFrom(messageId: Long) {
+        val convId = conversationId ?: return
+        if (_uiState.value.isStreaming) return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val all = messageDao.getByConversation(convId)
+                val idx = all.indexOfFirst { it.id == messageId }
+                if (idx < 0) return@withContext
+                val victims = all.subList(idx, all.size).toList()
+
+                // 正在朗读的正好在被删区间 → 先停
+                val speaking = _uiState.value.speakingId
+                if (speaking != null && victims.any { it.id == speaking }) {
+                    runCatching { appContainer.readAloudController.stop() }
+                    _uiState.update { it.copy(speakingId = null) }
+                }
+
+                // 图片路径先收集再删行（删行后 imagePaths 就拿不到了）
+                val imageFiles = victims
+                    .filter { it.role == MessageRole.USER }
+                    .flatMap { it.imagePaths.orEmpty().split("\n") }
+                    .filter { it.isNotBlank() }
+
+                victims.forEach { runCatching { messageDao.delete(it) } }
+                // ImageStore 只提供 save，没有 delete：直接删文件，失败无所谓
+                imageFiles.forEach { p -> runCatching { File(p).delete() } }
+
+                loadConversationIntoUi(convId)
+            }
+        }
+    }
+
+    /**
+     * 重新生成：删掉**最后一条** assistant 回答，按它前面那条 user 消息重新问一次。
+     *
+     * 只对最后一条有意义 —— 中间的某条重生成会让它后面的对话失去上下文锚点（"孤儿回答"），
+     * 所以 UI 只在最后一条 assistant 气泡上显示「重新生成」。
+     * 复用 [generateAssistant]：它本来就取"最后一条 user 消息"+ 其余历史重建 prompt，
+     * 所以删掉最后一条 assistant 之后调用它，等价于「把这句话重新说一遍」。
+     */
+    fun regenerateLast() {
+        val convId = conversationId ?: return
+        if (_uiState.value.isStreaming) return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val all = messageDao.getByConversation(convId)
+                val last = all.lastOrNull() ?: return@withContext
+                if (last.role != MessageRole.ASSISTANT) return@withContext
+                runCatching { messageDao.delete(last) }
+                loadConversationIntoUi(convId)
+                generateAssistant(convId, emptyList())
+            }
+        }
     }
 
     /**

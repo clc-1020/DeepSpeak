@@ -18,6 +18,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.companion.chat.data.local.dao.ConversationSummary
+import com.companion.chat.ui.theme.LocalChatColors
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -39,6 +40,7 @@ fun ConversationDrawerContent(
     onNewChat: () -> Unit
 ) {
     ModalDrawerSheet {
+        val palette = LocalChatColors.current
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -72,10 +74,10 @@ fun ConversationDrawerContent(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .background(
-                                if (selected) MaterialTheme.colorScheme.secondaryContainer
-                                else Color.Transparent
-                            )
+                            // 1.8.2：选中行原来是 secondaryContainer（M3 紫灰块），
+                            // 改成 accent 的暗铺底（方案 B）——黑底上是一块暗蓝灰，
+                            // 看得出"选中"，但不像霓虹灯。标题同步用 accent 色 + 加粗。
+                            .background(if (selected) palette.accentSurface else Color.Transparent)
                             .clickable { onSelect(s.id) }
                             .padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -85,6 +87,8 @@ fun ConversationDrawerContent(
                                 text = s.title.ifBlank { "新对话" },
                                 fontSize = 15.sp,
                                 fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                // 1.8.2：选中行标题用 accent，未选中仍是正文色
+                                color = if (selected) palette.accentText else MaterialTheme.colorScheme.onSurface,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )

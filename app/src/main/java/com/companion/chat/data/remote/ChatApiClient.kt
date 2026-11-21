@@ -69,11 +69,24 @@ class ChatApiClient(
             thinking = buildThinking(config, opts),
             reasoningEffort = if (opts.thinkingEnabled) opts.reasoningEffort else null
         )
+        // V1.8.0 诊断（临时）：打印真实请求体规模与最后一条消息 content 的结构。
+        // android.util.Log 在 JVM 单测里是未实现 stub，必须 runCatching 兜住。
+        val payloadJson = gson.toJson(payload)
+        runCatching {
+            val last = payload.messages.lastOrNull()
+            Log.w(
+                "MMDiag",
+                "model=${config.model} images=${images.size} payloadChars=${payloadJson.length} " +
+                    "apiMsgs=${payload.messages.size} lastRole=${last?.role} " +
+                    "lastIsArray=${last?.content is List<*>} " +
+                    "imgUrlHead=${images.firstOrNull()?.dataUrl?.take(40)}"
+            )
+        }
         val request = Request.Builder()
             .url(buildEndpoint(config.baseUrl))
             .header("Authorization", "Bearer ${config.apiKey}")
             .header("Accept", "text/event-stream")
-            .post(gson.toJson(payload).toRequestBody(JSON_MEDIA_TYPE))
+            .post(payloadJson.toRequestBody(JSON_MEDIA_TYPE))
             .build()
 
         val listener = object : EventSourceListener() {
