@@ -1,0 +1,81 @@
+.gradle
+.idea
+*.iml
+.DS_Store
+build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Android Studio
+/.idea/workspace.xml
+/.idea/libraries
+/.idea/gradle.xml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/vcs.xml
+
+# Built application files
+*.apk
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+
+# Gradle files
+.gradle/
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# Log Files
+*.log
+
+# Android Profiling
+*.hprof
+
+# ===== 陪聊 APP 项目专用（2026-11-21 加）=====
+# 备份快照含数据库与已解密偏好（里面有 API key），绝对不能进仓库
+.backups/
+# 构建产物（APK 单个就 140MB+）
+dist/
+release/
+captures/
+# 签名文件
+*.jks
+*.keystore
+# 本地数据库快照
+*.db
+*.db-wal
+*.db-shm
+# 运行日志
+*.log
+
+# 嵌入模型（90.5 MB，超出仓库合理体积；用 tools/fetch_embedding_model.ps1 下载）
+app/src/main/assets/models/*.onnx
+
+# ===== 开发临时产物 / 会话资料（2026-11-21 加，避免进公开仓库）=====
+/.tmp-db/
+/.icongen/
+/shots/
+/scripts/
+*.log
+hs_err_pid*.log
+/shantou_difangzhi*.png
+/make_doc.py
+/net-probe.mjs
+/probe_env.ps1
+/B9-审查提示词.md
+/CAPABILITY_MATRIX.md
+/output_layer_paths.md
+/refusal_probe_template.md
