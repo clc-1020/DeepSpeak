@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 网络权限 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 语音输入（任务 V2.3.2）：长按录音，16k/mono/PCM16 上传云端 ASR -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 通知栏常驻快捷入口（V2.3.6）：前台服务必须声明 FGS 权限；specialUse 类型需额外声明 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    
+    <!-- 唤醒权限 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    
+    <!-- 通知权限 (Android 13+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    
+    <!-- 精确闹钟权限 -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+
+    <!-- 开机广播（B9）：AlarmManager 的闹钟在重启后被系统清空，
+         必须靠 BOOT_COMPLETED / MY_PACKAGE_REPLACED 重新排回来，否则环境检查与用户提醒永久失效 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 保活引导（任务 6.2）：申请电池优化白名单（跳系统对话框需要此权限） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    
+    <!-- 位置权限 (粗略定位) - 第二版需要 -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Android 11+ 包可见性：允许查询系统 TTS 引擎（任务 4.1 引擎枚举），否则 queryIntentServices 返回空 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
+    <!-- Android 11+ 包可见性：保活引导要跳到各厂商的系统设置页（任务 6.2），
+         不声明就 resolveActivity 返回 null、startActivity 抛 SecurityException -->
+    <queries>
+        <package android:name="com.miui.securitycenter" />
+        <package android:name="com.miui.powerkeeper" />
+        <package android:name="com.huawei.systemmanager" />
+        <package android:name="com.hihonor.systemmanager" />
+        <package android:name="com.coloros.safecenter" />
+        <package android:name="com.oplus.safecenter" />
+        <package android:name="com.coloros.oppoguardelf" />
+        <package android:name="com.oplus.battery" />
+        <package android:name="com.oneplus.security" />
+        <package android:name="com.vivo.permissionmanager" />
+        <package android:name="com.vivo.abe" />
+        <package android:name="com.iqoo.secure" />
+        <package android:name="com.meizu.safe" />
+        <package android:name="com.samsung.android.lool" />
+    </queries>
+
+    <application
+        android:name=".CompanionApp"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Companion">
+        
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Companion">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- WorkManager 初始化 -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup" />
+        </provider>
+
+        <!-- 精确闹钟到点接收器（任务 3.3）：只由显式 PendingIntent 触发，无需导出 -->
+        <receiver
+            android:name=".worker.ReminderAlarmReceiver"
+            android:exported="false" />
+
+        <!-- 提醒「已完成」回执接收器（任务 3.7）：通知按钮触发，只由显式 PendingIntent 调起 -->
+        <receiver
+            android:name=".worker.ReminderDoneReceiver"
+            android:exported="false" />
+
+        <!-- 开机 / 升级后恢复闹钟（B9）。
+             两个 action 都是系统受保护广播，exported="true" 是标准写法（设 false 收不到）。
+             **刻意不注册 LOCKED_BOOT_COMPLETED**：本 App 用 EncryptedSharedPreferences(MasterKey)
+             + Room，用户解锁前取不到密钥，提前跑会崩或降级成空数据。 -->
+        <receiver
+            android:name=".worker.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 通知栏常驻快捷入口（V2.3.6）：只在 MainActivity.onResume 由前台界面拉起，
+             绝不在 CompanionApp 里启动（冷启动拉 FGS 在 Android 12+ 会抛 ForegroundServiceStartNotAllowedException） -->
+        <service
+            android:name=".service.QuickAccessService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="companion_quick_access" />
+        </service>
+
+        <!-- 语音输入浮层（V2.3.6）：只在用户点常驻通知的「语音输入」时拉起 -->
+        <activity
+            android:name=".ui.speech.VoiceInputActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Companion.Transparent" />
+
+    </application>
+
+</manifest>
