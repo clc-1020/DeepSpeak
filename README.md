@@ -1,7 +1,8 @@
 # DeepSpeak
 > 一个**纯客户端**的安卓 AI 陪伴应用：你自己填 API Key，她自己记住你、到点提醒你、主动找你说话，并且**有情绪、有关系、会想你**。
 > 目前仅支持安卓
-
+> 下载点这里↓↓↓
+> https://github.com/clc-pro/DeepSpeak/releases
 ---
 
 ## 这是什么
