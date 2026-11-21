@@ -1,12 +1,12 @@
-# DeepSpeak（深语）· 「她」
-
+# DeepSpeak
 > 一个**纯客户端**的安卓 AI 陪伴应用：你自己填 API Key，她自己记住你、到点提醒你、主动找你说话，并且**有情绪、有关系、会想你**。
+> 目前仅支持安卓
 
 ---
 
 ## 这是什么
 
-一个个人自用的 AI 陪聊 App。不是聊天壳子，重点在**长期关系**：
+一个AI 陪聊 App。重点在**提供情绪价值**：
 
 - **她记得**：三层记忆（短期/长期/日记）按相关性注入每轮对话，不是把记忆存了却不用
 - **她有情绪**：9 种情绪可共存、有强度、有诱因、30 分钟半衰；情绪会改变她**怎么说话**（不只是主动消息）
@@ -204,16 +204,6 @@ docs/
 - **对话内容**会发送到**你自己配置的模型服务**（默认 DeepSeek 兼容端点），请自行评估其隐私政策
 - 本项目为个人自用与学习目的，按 MIT 协议提供，**不提供任何明示或暗示的担保**
 
-## 设计参考
-
-早期方案阶段调研过的公开项目（**只借鉴设计思路，未复制代码**）：
-
-- 记忆：`dsh-fish-memory`、`dsh-memory-brain`、`dsh-forgetting-curve`、`memory-lattice`
-- 主动消息：`AI-driven-proactive-notification-system`、`proactive-ai-companion`、`whalecare`
-- 综合陪伴：`awesome-ai-companion`、`Miru`、`AI-Girlfriend`
-- 天气 / 语音：`Open-Meteo`（天气数据，见设置页署名）、`nova-android-assistant`、`OGAM`
-
-> ⚠️ 这些仓库的 License 各不相同（其中 `WeatherMaster` 为 GPL-3.0、`MinimalistWeather` 未声明 License、`dsh-fish-memory` 存在 MIT 与 CC BY-NC-ND 并存的矛盾声明）。若要引入任何代码，请自行核对 License 与可商用性。
 
 ## License
 
