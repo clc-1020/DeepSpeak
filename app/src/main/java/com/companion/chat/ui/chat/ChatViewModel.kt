@@ -407,6 +407,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * 后台预热天气缓存（V2.1.8）：进聊天页时异步拉一次，之后发消息就能秒读缓存。
      *
      * 全程 `runCatching` + IO：没有定位权限、没有网络、解析失败都不影响任何功能。
+     * 1.9.3.1：改走 [WeatherCache.loadWithRetry]——Open-Meteo 在本机网络下会间歇性超时，
+     * 只拉一次时那一次若撞上超时，缓存整天都是空的，发送路径读不到天气。
      */
     private fun prefetchWeather() {
         viewModelScope.launch(Dispatchers.IO) {
@@ -415,7 +417,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     is LocatedCity.Manual -> city.point
                     is LocatedCity.Auto -> city.point
                 }
-                appContainer.weatherCache.load(point, java.time.LocalDate.now())
+                appContainer.weatherCache.loadWithRetry(point, java.time.LocalDate.now())
             }
         }
     }
@@ -451,14 +453,29 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // 预算取上下文窗口的 12%（≈ token），由 ContextTrimmer 之外的独立额度控制 ——
         // 记忆块自己先按预算裁好，避免把对话历史挤掉。没相关记忆时返回 null，一个字都不加。
         val memoryDiag = StringBuilder()
+        // 1.9.4.0：情绪回忆按需筛选（冷却 + 情绪加权 + boost tiebreaker），注入后逐条记账。
+        val emotionalCandidates = runCatching {
+            val st = appContainer.moodService.currentEmotionState()
+            val dominant = st.hers.emotions.entries.maxByOrNull { it.value }?.key
+            appContainer.emotionalMemoryService.injectable(dominant)
+        }.getOrDefault(emptyList())
         val memoryBlock = runCatching {
             appContainer.memoryContextProvider.build(
                 userText = currentUser.content,
                 budgetChars = (effectiveConfig.contextWindow * MEMORY_CONTEXT_RATIO).toInt(),
+                emotional = emotionalCandidates.map { it.second },
                 // 2026-11-21：把每条候选的相似度分数打出来 —— 调阈值时只能靠这个，不能靠猜
                 onDiagnostics = { memoryDiag.append(it) }
             )
         }.getOrNull()
+        // 1.9.4.0：只有候选正文真的进了本轮记忆块才算"被回忆"，逐条刷新注入时刻 + 每日一次 boost。
+        if (!memoryBlock.isNullOrBlank()) {
+            runCatching {
+                emotionalCandidates.filter { memoryBlock.contains(it.second) }.forEach {
+                    appContainer.emotionalMemoryService.recall(it.first)
+                }
+            }
+        }
         // W 级（真机 D 级常被 ROM 吞）：用来核对「这轮到底注入了多少字记忆」+ 每条分数，
         // 0 = 没有相关记忆（正常，说明省 token 路径生效）
         android.util.Log.w("MemoryCtx", "本轮注入记忆块 ${memoryBlock?.length ?: 0} 字｜$memoryDiag")
@@ -592,6 +609,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
             // 任务 2.2/2.3：主对话成功后，后台异步提取 + 语义去重落库（独立调用、失败静默，不影响主对话）
             viewModelScope.launch(Dispatchers.IO) {
+                // 1.9.4.0：用户明确嫌烦（"别提/烦不烦"…）→ 最近被想起的情绪记忆扣分 + 冷却。
+                runCatching { appContainer.emotionalMemoryService.onDislike(currentUser.content) }
                 runCatching {
                     val recent = messageDao.getRecent(convId, MEMORY_RECENT_MESSAGES)
                     val ex = appContainer.memoryExtractor.extract(effectiveConfig, recent).getOrNull()

@@ -2326,3 +2326,115 @@ emotion_state = {"his":{"mood":"happy","intensity":0.7},
 ### 版本
 
 `1.3.6`（排程自愈）→ `1.3.7`（兜底话题），已装机。
+
+---
+
+## 1.9.3.1（2026-11-21 23:3x）清数据后天气一直看不到的根因与重试兜底
+
+**触发**：用户清除应用数据后问"你能看到我这边的天气吗"，AI 回答"没拿到天气数据"。查下来不是 system prompt 丢天气能力（`ContextBuilder.CAPABILITIES` 是 `const val`，清数据清不掉），而是**天气数据根本没进注记**。
+
+### 根因（两层叠加）
+
+1. 清数据 → `env_weather.xml`（天气缓存）被删，且 `app_state` 的手动城市也要重设。缓存的唯一后台填充点是 `ChatViewModel.prefetchWeather()`（`init` 里跑一次）。
+2. Open-Meteo 预报端点 `api.open-meteo.com/v1/forecast` 在**当前网络下间歇性超时**——同一 URL 真机 curl 实测：两次 12–20s 超时（HTTP:000）、两次 HTTP 200。原来 `prefetchWeather()` 只拉一次，那一次撞上超时 → 缓存整天为空 → 发送路径 `peek()` 只读缓存（绝不联网）→ reminder 第 3 段只有城市名 → AI 按 prompt 约定说"没拿到"。
+
+### 修复
+
+- `WeatherCache.loadWithRetry(point, today, attempts=2, retryDelayMs=1500)`：失败重试 1 次，仅后台预热调用。
+- `prefetchWeather()` 改调 `loadWithRetry`；**发送路径零改动**（仍 `peek()` 不联网，1.1.1 的"发送卡 2ms"教训不能回退）。
+- 仍失败就认了，由整点环境检查下次填——重试只解决"启动那一下抖动"，不做后台常驻轮询。
+
+### 关键教训（写进铁律）
+
+- **清应用数据是独立的故障注入路径**：它同时清空 `SharedPreferences`（人设、API Key、天气缓存）与 `app_state`（手动城市）。任何"只在启动时填一次"的缓存都要问一句：清数据后还有没有第二条填充路径？
+- **免费天气 API 的可用性不是 100%**：单点预热必须带重试，否则一次抖动 = 一整天功能缺失，且表现为"AI 说看不到"这种极难归因的现象。
+
+### 测试与版本
+
+- `WeatherCacheTest` +4（首次失败第二次成功 / 两次都失败 / 无坐标不发网络 / 缓存新鲜不触发重试）。
+- `RelationshipStageTest` +2（6→8：59 条 1 天 / 29 条 2 天仍生疏，另改写 30 条 1 天 / 5 条 3 天 / 200 条 3 天三条旧断言）。
+- 全量 **1015 / 124 suite / 0 失败**。`versionCode 65 / versionName 1.9.3.2`。
+
+---
+
+## 1.9.3.2（2026-11-21 23:4x）关系阶段门槛收紧
+
+**触发**：用户反馈"亲近和熟悉的标准太低了"，要求上调。
+
+### 新判定（纯函数 `RelationshipStage.of(Stats)`，输入仍是全库消息数 + 认识天数）
+
+```
+亲近 = 消息 ≥200 且 天数 ≥5          （旧：200 且 3）
+熟悉 = 消息 ≥60 或（天数 ≥2 且 消息 ≥30）  （旧：30 条或 2 天，无消息下限）
+生疏 = 其它
+```
+
+### 关键教训
+
+- **收紧"熟悉"时必须保留"消息单独达标"这条路**：新规则里消息 ≥60 不看天数直接熟悉，是为了避免"聊了几百条但才第 1 天"被卡在生疏（老用户/批量导入场景）。天数那条路则加了消息下限 30，防止"注册第 2 天啥也没聊就熟悉"。
+- **阈值只改常量与 `of()`，不动下游**：撒娇开关、想你门槛、情绪记忆写回、稳定前缀关系定位全部复用同一函数，改一处全链路生效。常量集中：新增 `FAMILIAR_MESSAGES=60` / `FAMILIAR_DAYS=2` / `FAMILIAR_DAYS_MESSAGES=30`，`CLOSE_DAYS` 3→5。
+- **别漏改注释**：`ContextBuilder` 的 `relationshipNote` 注释里写死了"30/200 条消息门槛"，已同步改成泛指；文档 §3.3 / §8 常量表 / §9 测试数 / §11 分期表四处一并更新。
+- **上级测试无需改**：`MoodServiceP3Test` 的 5 组 Stats（300/5、40/2、50/2、213/5、10/1）在新阈值下档位判定结论完全不变，验证了"只动纯函数、不动装配"的低风险性。
+
+### 测试与版本
+
+全量 **1015 / 124 suite / 0 失败**。`versionCode 65 / versionName 1.9.3.2`。
+
+---
+
+## 1.9.4.0（2026-11-22 00:xx）情绪记忆拟人化：三个踩坑结论
+
+**触发**：用户从"像真人"角度复盘——3 条上限不是问题，"删最旧 + 全量注入 + 同类并列"才是。定稿：pivotal/普通分层 + 打分淘汰 + 同类合并 + 按需注入 + boost/厌恶 + 注入冷却。
+
+### ① "刷新时间戳"不如"加分封顶"
+- 被提起一次就把 `createTime` 改成 now，看似让它新鲜，实际两个反效果：
+  1. **钉死老记忆**：反复被提起的旧条目永远排最前，新经历挤不进来；且改写了"那天发生了什么"的时间锚，语义失真。
+  2. **养出厌倦正反馈**：每提一次更易被再提一次，越烦它越来劲，最终变复读机。
+- 结论：时间锚不动，用 `boost` 表达"最近常被想起"——+0.05/次、每日最多一次、封顶 +0.2；厌恶 -0.1、下限 -0.2。衰减只由 score 体现。
+
+### ② 冷却必须 12h + 每日一次并存
+- 只有"每天最多一次"：23:59 注入、00:01 计数重置又注入，两分钟复读两次。
+- 只有"12h 冷却"：一天内仍可能 00:00 与 12:01 两次，感知仍是"一天念叨两遍"。
+- 两条都卡才堵住跨零点漏洞。普通记忆 48h（>24h 自然不会同日重复），不再叠加每日限制。
+
+### ③ 讨厌扣分，不删记忆
+- 用户说"别提"否的是**主动提起**，不是**这件事发生过**。删行会导致用户随后主动问时她矢口否认，比复读更伤。
+- 扣分（下限 -0.2）+ 7 天冷却让主动提起停下；第 2 次起 `coolingUntil = Long.MAX_VALUE` 永久停止。通知"别提"从短期记忆扩到长期，口径一致——两条链路都**不物理删除**。
+- boost / 冷却 / 次数必须落库，否则重启后"说了没用"，用户会重复表达厌恶。
+
+### ④ 测试 Fake DAO 的兼容性
+- 给 `@Dao` interface 加 `@Query` 新方法会强制 6 个 Fake DAO 测试类全部补实现，改动面大且易漏。
+- 本版改为服务层只用既有 `getAll/getById/insert/update/delete` 组合实现新逻辑，**DAO 一个方法都没加**，Fake 零改动——这是"共享文件小步改"原则的具体应用。
+
+### 测试与版本
+- 新增 `EmotionalMemoryScoreTest` 31 条 + `EmotionalMemoryServiceTest` 15 条 + `VersionConsistencyTest` 2 条（版本号守门：build.gradle 与 CHANGELOG 最新条目一致、versionCode 唯一且递增，防并发改版撞号）。全量 **1063 / 127 suite / 0 失败**。`versionCode 66 / versionName 1.9.4.0`。
+
+---
+
+## 1.9.4.1（2026-11-22）P4 方向②：关系阶段影响主动消息节奏 + 修容量 bug
+
+### 需求与设计
+主动消息频率原本与关系无关（固定 2h 检查 / 1h 冷却 / 每日上限 8）。用户要求"生疏少打扰、亲近更黏"。经讨论定为：**间隔从「上次用户说话」算起、随机**（生疏 3~4h / 熟悉 2~4h / 亲近 2~3h），每日上限保持 8 不变（16h 清醒 ÷ 2h 是刻意设计，用户要睡觉）。
+
+### 关键决策（写进铁律）
+- **间隔必须从「上次说话」算，不是从「上次她发消息」算**：真人不会在你刚聊完后马上又"主动"找你；`lastInteractionMillis` 现成，直接复用。
+- **随机用「上次说话时刻」当种子**：`Random(seed).nextInt(range)`。同一段"没说"期间等多久固定（不会每 2h 检查一次就重掷导致忽长忽短）；用户再说话 seed 变、重新掷。纯函数、可测、无需持久化随机值。
+- **不碰 Worker 周期/冷却常数**：改周期要 bump `SCHEDULE_SCHEMA`（1.0.5 事故）、冷却要 < 2h 周期（1.0.3 事故），一律不动。只把 `ProactiveGateContext` 的 1h 冷却换成关系档随机 gap（默认仍是 1h，测试零改动）。
+- **2h 检查粒度决定了精度上限**：目标 3~4h 实际会落在"达到后第一个 2h 检查点"，最多晚 2h。这是方案 A（不改周期、零风险）的固有代价，用户已接受。
+
+### 顺带修复（容量 bug，1.9.4.0 遗留）
+- `MemoryContextProvider.build` 里情绪候选原先追加在 long **末尾**，而 `MemoryContextBlock` 对 long 做 `distinct().take(12)` → 普通长期记忆 ≥12 条时，情绪回忆被整段静默切掉，功能无声失效。改为情绪候选排**前面**，永不因普通记忆多而被挤掉。加回归测试 `emotional_survives_when_normal_long_exceeds_limit`。
+
+### 测试与版本
+- `RelationshipStageTest` +3、`ProactiveGateRulesTest` +3、`MemoryContextProviderTest` +1。全量 **1070 / 127 suite / 0 失败**。`versionCode 67 / versionName 1.9.4.1`。
+
+---
+
+## 发布签名与打包（1.9.4.1 起，分享用）
+
+- **keystore**：`keystore/companion-release.jks`（别名 `companion`，RSA 2048，有效期 10000 天）。**务必离线备份**——丢了就无法给已安装用户推送新版（签名不一致只能卸载重装、丢数据）。
+- **密码**：写在项目根 `keystore.properties`（已加进 .gitignore），build.gradle 从中读 `storeFile/storePassword/keyAlias/keyPassword`。`*.jks` 与 `keystore.properties` **绝不能进仓库**。
+- **release 构建**：`.\gradlew.bat assembleRelease`。已开 R8（`minifyEnabled true`）+ 资源压缩（`shrinkResources true`）+ ABI 收窄（`arm64-v8a,armeabi-v7a`，去掉仅模拟器用的 x86/x86_64）。产物 `app/build/outputs/apk/release/app-release.apk`：**debug 142MB → release 81.4MB，dex 60MB→4.4MB**。
+- **R8 keep**：`proguard-rules.pro` 保留 ONNX/Retrofit/Gson + `com.companion.chat.data.**`（覆盖 Room 实体与 Gson DTO）。代码里无 `getIdentifier`/反射动态加载，故无动态资源/反射破坏风险；但**每次大改后仍要用 release 包真机跑一遍**（启动 + 进对话 + 记忆/去重/主动消息），R8 类问题只在运行期暴露。
+- **MIUI 真机安装**：`adb install` 会被 MIUI 拦（`INSTALL_FAILED_USER_RESTRICTED`）。用 root：`adb push apk /data/local/tmp/ && adb shell su -c 'pm install -r -t /data/local/tmp/app-release.apk'`。
+- **换签名会清数据**：debug 签名包 → release 签名包必须卸载（丢数据）。卸载前备份：`adb shell su -c 'tar -cf /sdcard/b.tar -C /data/data/com.companion.chat .' && adb pull /sdcard/b.tar`。分享给别人的用户各自独立安装、各自填 API Key，纯本地无服务器成本。

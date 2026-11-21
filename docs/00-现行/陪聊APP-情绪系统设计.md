@@ -83,16 +83,51 @@
 
 ```
 消息数 = MessageDao.countAll()；认识天数 = (now - firstTimestamp)/86400000 + 1
-亲近 = 消息≥200 且 天数≥3
-熟悉 = 消息≥30 或 天数≥3（另：天数≥2 也算熟悉）
+亲近 = 消息≥200 且 天数≥5
+熟悉 = 消息≥60 或（天数≥2 且 消息≥30）
 生疏 = 其它
 ```
+> 1.9.3.2（vc65）收紧前：亲近 200 且 3 天、熟悉 30 条或 2 天。用户反馈太容易升级，上调门槛；判定函数与下游逻辑未动，只改阈值。
 
 ### 3.4 情绪记忆写回 `memory_long`（`category = relationship`）
 
 ```
 2026-11-21 你连夸我厉害可爱，我当时开心。
 ```
+
+### 3.5 情绪记忆拟人化改造（1.9.4.0 / vc66）
+
+`category = relationship` 且 `intensity > 0` 的情绪记忆，从"按时间删最旧"改为"按重要性打分淘汰"。**记忆不删，只决定还主不主动提起。**
+
+**分层**：pivotal（刻骨铭心）每种情绪 1 条、共 4 条，写入强度 ≥0.85 且为同情绪当前最强者才标记，只被同情绪更强者顶替、不参与打分淘汰；普通记忆上限 4 条，阈值仍是强度 ≥0.6。
+
+**打分**：`score = clamp(intensity + boost, -0.2, 1.0) × 0.5^(距今天数/30)`。boost **不刷新 createTime**（时间锚是"那天发生了什么"，语义不能失真）。满容量时在普通记忆里淘汰 score 最低的一条。
+
+**boost 增减**：被真实注入一次 +0.05、每日最多一次（app_state `emotion_memory_boost_day` 记 `id@日期`）、封顶 +0.2；用户表达厌恶 -0.1、下限 -0.2。
+
+**同类合并**：同情绪 + trigger 前 8 字重合 → 合并：强度取大、次数 +1、正文 `EmotionalMemoryScore.mergeText` 追加「共 N 次」。
+
+**注入**：`injectable()` 取情绪记忆候选（当前主导情绪匹配 +0.5 加权、boost 只作 tiebreaker），每轮最多 2 条并进 `memoryBlock`；真正注入后 `recall()` 记账。冷却：pivotal **12h 且每天最多一次**（两条都卡，堵跨零点漏洞），普通 48h。
+
+**厌恶**：命中「别提/不想提/没说过/你怎么又/烦不烦/别念叨/别说了/别再提」→ 最近被注入的一条扣分 + 7 天冷却；第 2 次起 `coolingUntil = Long.MAX_VALUE` 永久停止主动注入。长期记忆兜底话题用 `PendingMessageContent.LongMemory(id)` 带 id 入队，通知"别提这个"回执走 `EmotionalMemoryService.dismissById`——两条链路都**不物理删除**。
+
+**实现落点**：纯函数 `domain/emotion/EmotionalMemoryScore.kt`（31 条单测）；编排 `data/mood/EmotionalMemoryService.kt`（15 条单测）；DB `memory_long` 加 8 列 + 显式 `MIGRATION_7_8`。判别"是否情绪记忆"用 `intensity > 0`——旧数据与事实类记忆 intensity=0，天然不被当情绪回忆处理，零迁移风险。
+
+**常量表（1.9.4.0 新增，改这里要同步代码）**
+
+| 常量 | 值 | 位置 |
+|---|---|---|
+| **1.9.4.0 新增常量** | | |
+| pivotal 阈值 / 每情绪 / 总数 | 0.85 / 1 / 4 | `EmotionalMemoryService` |
+| 普通情绪记忆上限 | 4 | `EmotionalMemoryService.NORMAL_LIMIT` |
+| boost 单次 / 每日 / 上限 | +0.05 / 1 / +0.2 | `EmotionalMemoryScore` |
+| 厌恶扣分 / 下限 / 冷却 | -0.1 / -0.2 / 7 天 | `EmotionalMemoryScore` |
+| 打分半衰期 | 30 天 | `EmotionalMemoryScore.DECAY_HALF_LIFE_DAYS` |
+| 注入冷却 pivotal / 普通 | 12h+每日一次 / 48h | `EmotionalMemoryScore` |
+| DB 版本 / 迁移 | 8 / `MIGRATION_7_8` | `AppDatabase` |
+| **1.9.4.1 新增常量** | | |
+| 关系→主动间隔（小时区间） | 生疏 3~4 / 熟悉 2~4 / 亲近 2~3 | `RelationshipStage.proactiveIntervalHoursRange` |
+| 间隔随机种子 | = 上次用户说话时刻（同段稳定，再说话重掷） | `RelationshipStage.proactiveGapMillis` |
 
 ---
 
@@ -191,7 +226,7 @@ system（稳定前缀）只加一句**永不变**的话：
 | 想你门槛 | 生疏 6h / 熟悉 3h / 亲近 1h | `RelationshipStage.missingFloorHours` |
 | 想你封顶 | 0.7 | `MissingEmotion.CAP` |
 | 主动上限微调 | 兴奋/想你 +1；低落/烦躁 -1（0~10） | `EmotionProactivePolicy` |
-| 关系门槛 | 熟悉 30 条或 3 天；亲近 200 条且 3 天 | `RelationshipStage` |
+| 关系门槛（1.9.3.2） | 熟悉 60 条或（2 天且 30 条）；亲近 200 条且 5 天 | `RelationshipStage` |
 | **热络度半衰 / 下限 / 每轮** | **14 天 / 0.05 / +0.12** | `Warmth` |
 | **撒娇门槛** | **亲近 且 热络度 ≥0.5** | `Warmth.AFFECTION_MIN` |
 | 情绪记忆 | 强度 ≥0.6、最多 3 条、白名单 4 种 | `EmotionMemory` |
@@ -210,7 +245,7 @@ system（稳定前缀）只加一句**永不变**的话：
 | `MissingEmotion`(4) | <2h 不产生、随时长递增、24h 封顶、刚过门槛不归零 |
 | `EmotionProactivePolicy`(5) | +1 / -1 / 正负并存不减 / 弱情绪不动 / 缓存 |
 | `EmotionNotificationTitle`(3) | 情绪→标题、弱/空回落、最强者优先 |
-| `RelationshipStage`(6) | 三档阈值、亲近需双条件、想你门槛递减、文案分档 |
+| `RelationshipStage`(8) | 三档阈值、亲近需双条件、熟悉双路径、想你门槛递减、文案分档 |
 | `EmotionMemory`(5) | 只在亲近、强度门槛、烦躁/低落永不写、第一人称格式 |
 | `Warmth`(6) | 14 天减半、下限 0.05、回暖封顶、标签、冷时出行/热时无行 |
 | `MoodServiceEmotionTest`(10) / `MoodServiceP3Test`(8) | 落库、负面无 trigger、取大、闸门、衰减、注入文案、示弱配额、撒娇双门槛、情绪记忆 3 条上限、回暖、14 天衰减 |
@@ -270,7 +305,10 @@ ui/settings/SettingsScreen.kt    四行展示（关系 / 热络度 / 备注 / �
 | **P3** | 关系三档 + 撒娇只给亲近 + 情绪写回长期记忆（≤3 条）+ 关系定位进稳定前缀 | **1.5.0（39）** |
 | **P3.1** | 热络度（14 天半衰）+ 撒娇双门槛 + 偏冷提示行 + 设置页对照式备注 | **1.5.1（40）** |
 | **1.6.0** | 版本号统一（合并主动消息修复线 1.3.5–1.3.7），代码 = 情绪 P1–P3.1 + 主动消息修复 | **1.6.0（44）** |
-| P4（未做） | 情绪细化（9→更多档）、关系阶段影响主动消息节奏、情绪记忆在对话里主动引用 | — |
+| **1.9.3.2** | 关系门槛收紧（亲近 200 且 5 天；熟悉 60 或 2 天且 30 条），只改阈值 | **1.9.3.2（65）** |
+| **1.9.4.0** | 情绪记忆拟人化：pivotal/普通分层 + 打分淘汰 + 同类合并 + 回忆/厌恶 boost + 注入冷却与嫌烦抑制；Room 7→8 | **1.9.4.0（66）** |
+| **1.9.4.1** | P4方向②：关系阶段影响主动消息间隔（生疏3~4h/熟悉2~4h/亲近2~3h，从上次说话算起随机）；修情绪回忆被普通记忆挤出的容量 bug | **1.9.4.1（67）** |
+| P4（剩余） | 方向③情绪记忆主动引用（1.9.4.0 已具备主体，剩正文自然化打磨，缓做）；方向①情绪细化（9→更多档）缓做，进观察清单 | — |
 
 ---
 

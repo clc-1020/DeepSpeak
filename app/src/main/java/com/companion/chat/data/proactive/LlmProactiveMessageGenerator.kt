@@ -2,6 +2,8 @@ package com.companion.chat.data.proactive
 
 import com.companion.chat.data.local.dao.ConversationDao
 import com.companion.chat.data.local.dao.MemoryShortDao
+import com.companion.chat.data.local.dao.MemoryLongDao
+import com.companion.chat.domain.proactive.ProactiveFallbackTopics
 import com.companion.chat.data.local.dao.MessageDao
 import com.companion.chat.data.local.entity.PendingMessageEntity
 import com.companion.chat.data.remote.ApiConfig
@@ -33,6 +35,8 @@ class LlmProactiveMessageGenerator(
     private val recentLimit: Int = 3,
     /** 情绪系统 P1：主动消息也要带颜文字，所以这里拿「她此刻的情绪」。默认空 = 不加。 */
     private val emotionProvider: suspend () -> Map<String, Double> = { emptyMap() },
+    /** 1.9.4.0：长期记忆兜底话题需要读正文；null 时长记忆兜底不发（旧装配零改动）。 */
+    private val memoryLongDao: MemoryLongDao? = null,
 ) : ProactiveMessageGenerator {
 
     override suspend fun generate(pending: PendingMessageEntity): String? {
@@ -67,6 +71,9 @@ class LlmProactiveMessageGenerator(
         when (val c = PendingMessageContent.decode(pending.content)) {
             is PendingMessageContent.PlainText -> c.text
             is PendingMessageContent.Memory -> memoryShortDao.getById(c.memoryId)?.content
+            // 1.9.4.0：长期记忆兜底，读正文包成 hook（同 longMemoryHook 口径，搭不上就随便聊别硬提）
+            is PendingMessageContent.LongMemory ->
+                memoryLongDao?.getById(c.memoryId)?.content?.let { ProactiveFallbackTopics.longMemoryHook(it) }
             is PendingMessageContent.Instruction -> c.task
             // 环境钩子只带 stableId，正文走泛化措辞（计划书 §3.4：不拼数值、不读天气缓存）
             is PendingMessageContent.Environment -> EnvironmentHooks.genericText(c.stableId)

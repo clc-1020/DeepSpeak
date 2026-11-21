@@ -8,6 +8,7 @@ package com.companion.chat.domain.proactive
  *
  * 编码用紧凑 tag 前缀（比 JSON 轻，无需 Gson，纯 JVM 可测）：
  *  - [Memory]    → `"memory:<id>"`
+ *  - [LongMemory] → `"longmem:<id>"`（1.9.4.0：长期情绪记忆话题，通知"别提"回执用）
  *  - [PlainText] → `"text:<text>"`
  *  - [Instruction] → `"instr:<memoryId|0>:<task>"`
  *  - [Environment] → `"env:<stableId>"`
@@ -19,6 +20,12 @@ sealed class PendingMessageContent {
 
     /** 记忆话题驱动的消息，正文由 3.5 用该记忆生成。 */
     data class Memory(val memoryId: Long) : PendingMessageContent()
+
+    /**
+     * 1.9.4.0：长期情绪记忆话题（无短期记忆时的兜底）。正文由 hook 文本生成，
+     * 这里只带 id，供通知"别提这个"回执调用 [com.companion.chat.data.mood.EmotionalMemoryService.dismissById]。
+     */
+    data class LongMemory(val memoryId: Long) : PendingMessageContent()
 
     /** 纯文本内容（指令提醒、节日文案等直接可发的文本）。 */
     data class PlainText(val text: String) : PendingMessageContent()
@@ -68,6 +75,7 @@ sealed class PendingMessageContent {
     /** 编码为写入 `pending_messages.content` 的字符串。 */
     fun encode(): String = when (this) {
         is Memory -> MEMORY_PREFIX + memoryId
+        is LongMemory -> LONGMEM_PREFIX + memoryId
         is PlainText -> TEXT_PREFIX + text
         is Instruction -> INSTR_PREFIX + (memoryId ?: 0L) + ":" + task
         is Environment -> ENV_PREFIX + stableId
@@ -78,6 +86,7 @@ sealed class PendingMessageContent {
 
     companion object {
         const val MEMORY_PREFIX = "memory:"
+        const val LONGMEM_PREFIX = "longmem:"
         const val TEXT_PREFIX = "text:"
         const val INSTR_PREFIX = "instr:"
         const val ENV_PREFIX = "env:"
@@ -88,6 +97,9 @@ sealed class PendingMessageContent {
         fun decode(raw: String): PendingMessageContent = when {
             raw.startsWith(MEMORY_PREFIX) ->
                 raw.removePrefix(MEMORY_PREFIX).toLongOrNull()?.let { Memory(it) } ?: PlainText(raw)
+            // 1.9.4.0：longmem 必须放在 memory 之后判断（前缀不同不冲突，但保持顺序清晰）
+            raw.startsWith(LONGMEM_PREFIX) ->
+                raw.removePrefix(LONGMEM_PREFIX).toLongOrNull()?.let { LongMemory(it) } ?: PlainText(raw)
             raw.startsWith(TEXT_PREFIX) -> PlainText(raw.removePrefix(TEXT_PREFIX))
             raw.startsWith(INSTR_PREFIX) -> {
                 val rest = raw.removePrefix(INSTR_PREFIX)
@@ -121,11 +133,18 @@ sealed class PendingMessageContent {
             else -> PlainText(raw)
         }
 
-        /** 便捷取记忆 id：仅当内容为 [Memory] 时返回，否则 null。 */
-        fun memoryIdOrNull(raw: String): Long? = (decode(raw) as? Memory)?.memoryId
+        /** 便捷取记忆 id：Memory 或 LongMemory 都返回，否则 null。通知"别提"按钮用。 */
+        fun memoryIdOrNull(raw: String): Long? = when (val c = decode(raw)) {
+            is Memory -> c.memoryId
+            is LongMemory -> c.memoryId
+            else -> null
+        }
 
         /** 指令提醒关联的短期记忆 id（「已完成」回执删除用）；非指令返回 null。 */
         fun completeMemoryIdOrNull(raw: String): Long? = (decode(raw) as? Instruction)?.memoryId
+
+        /** 1.9.4.0：长期记忆兜底话题的 id（通知"别提"回执用）；非 LongMemory 返回 null。 */
+        fun longMemoryIdOrNull(raw: String): Long? = (decode(raw) as? LongMemory)?.memoryId
 
         /** 追问内容取 id（V2.2.5 通知按钮用）；非追问返回 null。 */
         fun followupOrNull(raw: String): Followup? = decode(raw) as? Followup

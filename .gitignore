@@ -54,6 +54,7 @@ captures/
 # 签名文件
 *.jks
 *.keystore
+keystore.properties
 # 本地数据库快照
 *.db
 *.db-wal

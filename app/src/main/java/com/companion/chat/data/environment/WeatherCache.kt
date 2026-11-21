@@ -3,6 +3,7 @@ package com.companion.chat.data.environment
 import com.companion.chat.domain.environment.WeatherSnapshot
 import com.google.gson.JsonArray
 import com.google.gson.JsonParser
+import kotlinx.coroutines.delay
 import java.time.LocalDate
 
 /**
@@ -66,6 +67,33 @@ class WeatherCache(
         val cachedAt = store.get(EnvironmentKeys.WEATHER_CACHE_AT)?.toLongOrNull() ?: return null
         if (!isFresh(cachedAt)) return null
         return parse(cachedJson, today).today
+    }
+
+    /**
+     * 失败重试版 [load]（1.9.3.1）：**仅用于后台预热**，绝不用于发送路径。
+     *
+     * 背景（2026-11-21 真机）：清掉应用数据后，天气缓存为空，唯一能填缓存的
+     * [prefetchWeather] 只拉一次；而 Open-Meteo 预报端点在当前网络下**间歇性超时**
+     * （实测同一 URL 既有 12–20s 超时、也有 HTTP 200）。一旦那一次撞上超时，
+     * 缓存就永远是空的，发送路径的 [peek] 只读缓存 → 用户一直看不到天气。
+     *
+     * 判定「失败」= [load] 返回 [WeatherBundle.EMPTY]（无坐标 / 非 2xx / 解析不出）。
+     * 重试 [DEFAULT_RETRY_ATTEMPTS] 次，每次间隔 [RETRY_DELAY_MS]；仍失败就认了，
+     * 由整点环境检查下次再填，绝不阻塞任何前台路径。
+     */
+    suspend fun loadWithRetry(
+        point: GeoPoint?,
+        today: LocalDate,
+        attempts: Int = DEFAULT_RETRY_ATTEMPTS,
+        retryDelayMs: Long = RETRY_DELAY_MS,
+    ): WeatherBundle {
+        var last = WeatherBundle.EMPTY
+        repeat(attempts) { index ->
+            last = load(point, today)
+            if (last.today != null) return last
+            if (index < attempts - 1 && retryDelayMs > 0) delay(retryDelayMs)
+        }
+        return last
     }
 
     /**
@@ -170,6 +198,12 @@ class WeatherCache(
     companion object {
         /** 24 小时。 */
         const val DEFAULT_TTL_MILLIS = 24 * 60 * 60 * 1000L
+
+        /** 后台预热总尝试次数（1.9.3.1）：首次 + 1 次重试，应对 Open-Meteo 间歇超时。 */
+        const val DEFAULT_RETRY_ATTEMPTS = 2
+
+        /** 两次尝试之间的退避。只在后台协程里 delay，不占发送路径。 */
+        const val RETRY_DELAY_MS = 1_500L
     }
 }
 

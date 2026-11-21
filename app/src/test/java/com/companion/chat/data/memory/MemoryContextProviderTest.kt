@@ -157,4 +157,18 @@ class MemoryContextProviderTest {
         // 长期表读失败被内层 runCatching 吞掉 → 剩余为空 → 返回 null，不抛
         assertNull(p.build("今天好累", budgetChars = 2000))
     }
+
+    /**
+     * 1.9.4.1 回归：普通长期记忆 ≥12 条（LONG_LIMIT）时，情绪回忆**不能**被 take(12) 静默挤掉。
+     * 之前 emotional 追加在 long 末尾，被整段切掉 → 功能无声失效。
+     */
+    @Test
+    fun emotional_survives_when_normal_long_exceeds_limit() = runBlocking {
+        val manyNormal = (1..15).map {
+            MemoryLongEntity(content = "普通事实$it", category = "fact", createTime = it.toLong())
+        }
+        val p = provider(long = manyNormal)
+        val block = p.build("今天好累", budgetChars = 5000, emotional = listOf("2026-11-21 你夸我，我当时开心。"))!!
+        assertTrue("情绪回忆不能被普通记忆挤出", block.contains("你夸我"))
+    }
 }

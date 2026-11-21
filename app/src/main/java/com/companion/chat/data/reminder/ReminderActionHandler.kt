@@ -20,7 +20,12 @@ import com.companion.chat.domain.reminder.FollowupPort
 class ReminderActionHandler(
     private val followupPort: FollowupPort,
     private val queue: PendingMessageQueue,
-    private val deleteMemory: suspend (Long) -> Unit
+    private val deleteMemory: suspend (Long) -> Unit,
+    /**
+     * 1.9.4.0：长期记忆的"别提"回执（扣分 + 冷却，不删行）。
+     * 返回 true = 该 id 命中了长期记忆，此时**不再**走短期 deleteMemory。
+     */
+    private val dismissLongMemory: suspend (Long) -> Boolean = { false },
 ) {
 
     /**
@@ -42,7 +47,10 @@ class ReminderActionHandler(
         null, NotificationActions.ACTION_DONE -> {
             var handled = false
             if (memoryId > 0L) {
-                deleteMemory(memoryId)             // 任务 3.7 原行为，保留
+                // 1.9.4.0：先试长期记忆（兜底话题通知）；命中则只扣分冷却，不删行。
+                // 没命中再按旧的短期记忆删除语义处理（指令提醒"已完成"）。
+                val longHandled = runCatching { dismissLongMemory(memoryId) }.getOrDefault(false)
+                if (!longHandled) deleteMemory(memoryId)
                 handled = true
             }
             if (reminderId > 0L) {

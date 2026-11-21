@@ -257,7 +257,9 @@ class CompanionApp : Application() {
         ReminderActionHandler(
             followupPort = followupPort,
             queue = pendingMessageQueue,
-            deleteMemory = { id -> database.memoryShortDao().deleteById(id) }
+            deleteMemory = { id -> database.memoryShortDao().deleteById(id) },
+            // 1.9.4.0：长期记忆兜底通知的"别提"回执 → 扣分 + 冷却，不删行
+            dismissLongMemory = { id -> emotionalMemoryService.dismissById(id) }
         )
     }
 
@@ -323,6 +325,17 @@ class CompanionApp : Application() {
     }
 
     /**
+     * 1.9.4.0：情绪记忆拟人化服务（写入合并 / 注入冷却 / 回忆与厌恶记账）。
+     * 只依赖既有 DAO 方法，零新增 DAO 接口。
+     */
+    val emotionalMemoryService: com.companion.chat.data.mood.EmotionalMemoryService by lazy {
+        com.companion.chat.data.mood.EmotionalMemoryService(
+            longDao = database.memoryLongDao(),
+            appStateDao = database.appStateDao(),
+        )
+    }
+
+    /**
      * mood 更新（任务 5.1 / V2.2.2）：每 5 轮对话独立调用模型判断用户心情，写 app_state；
      * 有活跃追问链时每轮都调，并按 followup_status 推进追问。失败保持原 mood。
      * 独立无状态请求（不复用主会话 ID）。
@@ -342,6 +355,8 @@ class CompanionApp : Application() {
             },
             // P3：情绪事件写回长期记忆（只在亲近阶段、强度 ≥0.6、每天最多一条）
             memoryLongDao = database.memoryLongDao(),
+            // 1.9.4.0：拟人化写入（同类合并 / pivotal / 打分淘汰），优先于旧逻辑
+            emotionalMemory = emotionalMemoryService,
         )
     }
 
@@ -438,6 +453,10 @@ class CompanionApp : Application() {
              * 一天一次，比现在不触发更糟。数据不足仍返回 null 是安全侧。
              */
             replyRateProvider = { null },
+            // 1.9.4.1：关系档 → 主动消息间隔（生疏 3~4h / 熟悉 2~4h / 亲近 2~3h，从上次说话算起随机）
+            relationshipStageProvider = {
+                runCatching { moodService.currentRelationshipStage() }.getOrNull()
+            },
             // 临时调试开关（测完把 ProactiveDebugFlags 改回 false）
             debugBypass = ProactiveDebugFlags.ENABLED && ProactiveDebugFlags.BYPASS_GATE
             // 勿扰不在这里拦（任务 4.3：勿扰只静音语音、通知照发）；是否连通知一起静音由 7.2 决定
@@ -477,12 +496,9 @@ class CompanionApp : Application() {
             },
             queue = pendingMessageQueue,
             recallFallback = {
-                // 2026-11-21：短期记忆为空时的兜底话题（长期记忆 → 纯关心）。
-                // 真机事故：短期记忆被清空后检查一直 NO_HOOK，用户以为「随机关心坏了」。
+                // 1.9.4.0：兜底长期记忆带 id 回传，供通知"别提这个"扣分；纯关心走 plainTextFallback。
                 val dao = database.appStateDao()
                 val nowMs = System.currentTimeMillis()
-
-                // ① 长期记忆（每条 7 天内不重复）
                 val forFallback = runCatching { database.memoryLongDao().getAll() }.getOrDefault(emptyList())
                     .sortedByDescending { it.createTime }
                     .map { ProactiveFallbackTopics.LongPick(it.id, it.content) }
@@ -497,20 +513,21 @@ class CompanionApp : Application() {
                         )
                     )
                     android.util.Log.w("ProactiveCheck", "兜底话题=长期记忆 id=${pick.id}")
-                    ProactiveFallbackTopics.longMemoryHook(pick.text)
-                } else {
-                    // ② 纯关心（每天最多 1 次 + 距上条主动消息 ≥3h）
-                    val today = java.time.LocalDate.now().toString()
-                    val lastKind = dao.get(AppStateEntity.KEY_PROACTIVE_KINDNESS_DATE)
-                    val lastDelivered = dao.get(AppStateEntity.KEY_PROACTIVE_LAST_DELIVERED)?.toLongOrNull()
-                    if (ProactiveFallbackTopics.kindnessAllowed(lastKind, today, lastDelivered, nowMs)) {
-                        dao.put(AppStateEntity(AppStateEntity.KEY_PROACTIVE_KINDNESS_DATE, today))
-                        android.util.Log.w("ProactiveCheck", "兜底话题=纯关心（今日首次）")
-                        ProactiveFallbackTopics.KINDNESS_HOOK
-                    } else {
-                        null
-                    }
-                }
+                    pick.id to ProactiveFallbackTopics.longMemoryHook(pick.text)
+                } else null
+            },
+            plainTextFallback = {
+                // 长期记忆都用完了 → 纯关心（每天最多 1 次 + 距上条主动消息 ≥3h）。
+                val dao = database.appStateDao()
+                val nowMs = System.currentTimeMillis()
+                val today = java.time.LocalDate.now().toString()
+                val lastKind = dao.get(AppStateEntity.KEY_PROACTIVE_KINDNESS_DATE)
+                val lastDelivered = dao.get(AppStateEntity.KEY_PROACTIVE_LAST_DELIVERED)?.toLongOrNull()
+                if (ProactiveFallbackTopics.kindnessAllowed(lastKind, today, lastDelivered, nowMs)) {
+                    dao.put(AppStateEntity(AppStateEntity.KEY_PROACTIVE_KINDNESS_DATE, today))
+                    android.util.Log.w("ProactiveCheck", "兜底话题=纯关心（今日首次）")
+                    ProactiveFallbackTopics.KINDNESS_HOOK
+                } else null
             },
             // V2.1.7：runner 传进来的是完整键 fes_sent_<name>_<dateKey>；
             // 查键与下面的记账共用 FestivalDedupe，避免两边算法分叉
@@ -539,7 +556,9 @@ class CompanionApp : Application() {
                 moodProvider = { moodService.currentMood() },
                 // 情绪系统 P1（2026-11-21）：主动消息也按「她此刻的情绪」追加颜文字
                 // P2：「想你」只在主动消息路径积累（离开越久越强，封顶 0.7）
-                emotionProvider = { moodService.emotionsWithAwayBoost() }
+                emotionProvider = { moodService.emotionsWithAwayBoost() },
+                // 1.9.4.0：长期记忆兜底话题需要读正文
+                memoryLongDao = database.memoryLongDao()
             ),
             writer = RoomConversationWriter(
                 conversationDao = database.conversationDao(),

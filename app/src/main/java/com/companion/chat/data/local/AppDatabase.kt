@@ -39,7 +39,7 @@ import com.companion.chat.data.local.entity.ReminderEntity
         PendingMessageEntity::class,
         AppStateEntity::class
     ],
-    version = 7,
+    version = 8,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -69,6 +69,24 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v7 → v8（1.9.4.0）：memory_long 加 4 列，情绪记忆拟人化。
+         * 全部 NOT NULL + DEFAULT，旧行自动填默认值（intensity=0 即"非情绪记忆"，零行为变化）。
+         * Boolean 在 SQLite 里存 INTEGER 0/1，与 entity 的 @ColumnInfo(defaultValue="0") 配对。
+         */
+        internal val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE memory_long ADD COLUMN intensity REAL NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE memory_long ADD COLUMN boost REAL NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE memory_long ADD COLUMN pivotal INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE memory_long ADD COLUMN occurrenceCount INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("ALTER TABLE memory_long ADD COLUMN lastInjectedAt INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE memory_long ADD COLUMN lastInjectedDay TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE memory_long ADD COLUMN coolingUntil INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE memory_long ADD COLUMN dislikeCount INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         @Volatile
         private var INSTANCE: AppDatabase? = null
 
@@ -79,7 +97,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     DB_NAME
                 )
-                    .addMigrations(MIGRATION_6_7)
+                    .addMigrations(MIGRATION_6_7, MIGRATION_7_8)
                     // 已验证：6→7 显式迁移 + instrumented 测试全绿，移除破坏式回退（§3.1 / 步骤 7）
                     .build()
                     .also { INSTANCE = it }

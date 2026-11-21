@@ -49,7 +49,7 @@ enum class ProactiveBlockReason {
     NONE,            // 放行
     MASTER_OFF,      // 主动消息总开关关闭（任务 7.1）
     DO_NOT_DISTURB,  // 勿扰区间
-    COOLDOWN,        // 距上次交互 < 2h
+    COOLDOWN,        // 距上次交互不足「本轮要求间隔」（1.9.4.1：关系档随机 3~4h/2~4h/2~3h，默认兜底 1h）
     DAILY_LIMIT,     // 今日自发消息已达上限
     LOW_REPLY_RATE,  // 近 7 天回复率 < 20% → 降频一天一次
     NO_HOOK          // 记忆/环境钩子都召不出
@@ -73,7 +73,7 @@ data class ProactiveDecision(
  * @param category 消息类别
  * @param lastInteractionMillis 上次用户交互时间（null=从未/未知）
  * @param spontaneousSentToday 今日已发「自发」消息条数（指令/追问/手动测试不计）
- * @param dailyLimit 每日自发上限（默认 8，与「每 2 小时一条」对齐）
+ * @param dailyLimit 每日自发上限（默认 8 = 亲近档最密 2h 一条时 16 小时清醒内的封顶）
  * @param replyRate7d 近 7 天主动消息回复率（null=数据不足，按不拦截处理）
  * @param replyRateThreshold 回复率阈值（默认 0.2）
  * @param sentAnySpontaneousToday 今日是否已发过任意自发消息（用于「降频到一天一次」判断）
@@ -96,7 +96,12 @@ data class ProactiveGateContext(
     val dndEnabled: Boolean = false,
     val dndStartMinute: Int = 23 * 60,
     val dndEndMinute: Int = 7 * 60,
-    val enabled: Boolean = true
+    val enabled: Boolean = true,
+    /**
+     * 1.9.4.1：本轮最低间隔（毫秒），默认 = [ProactiveGateRules.COOLDOWN_MILLIS]（向后兼容）。
+     * 生产由关系档随机算出（生疏 3~4h / 熟悉 2~4h / 亲近 2~3h），从「上次交互」起算。
+     */
+    val proactiveGapMillis: Long = ProactiveGateRules.COOLDOWN_MILLIS
 )
 
 /**
@@ -106,7 +111,7 @@ data class ProactiveGateContext(
  *  0. **总开关**：主动消息关闭 → 一律拦截。
  *  1. **勿扰**：区间内一律拦截（对指令提醒/追问也生效）。
  *  2. 指令提醒 / 追问：仅受勿扰，其余闸门全部绕过 → 放行。
- *  3. **冷却**：距上次交互 < 1h → 拦截。
+ *  3. **冷却/间隔**：距上次交互不足「本轮要求间隔」→ 拦截（1.9.4.1 起间隔由关系档随机给出，默认兜底 1h）。
  *  4. **每日上限**：今日自发消息 ≥ 上限 → 拦截（指令/追问不计入，前面已放行）。
  *  5. **回复率降频**：近 7 天回复率 < 阈值且今日已发过 → 拦截（降到一天一次）。
  *  6. **无钩子**：记忆/环境钩子都召不出 → 拦截。
@@ -117,17 +122,18 @@ object ProactiveGateRules {
     /**
      * 每日自发消息默认上限。
      *
-     * 与「每 2 小时一条」对齐：勿扰 23:00–07:00 之外的 16 小时 ÷ 2h = 8 条。
-     * 原来写 3 会让「2h 周期」在第 4 次检查后永久静默（实测：白天就再也收不到）。
+     * **1.9.4.1 起**：最密档是"亲近"（间隔 2~3h），16 小时清醒 ÷ 2h ≈ 8 条 = 封顶。
+     * 生疏/熟悉更疏，实际条数远低于 8，所以这个上限天然不会被撞满。
+     * （历史上此值 8 是按"每 2 小时一条"算的；现在含义变成"最密档封顶"，数值不变。）
      */
     const val DEFAULT_DAILY_LIMIT: Int = 8
 
     /**
-     * 冷却窗口：距上次交互不足 1 小时。
+     * 兜底冷却窗口：拿不到关系档 / 从未交互时，"距上次交互不足 1 小时"就拦。
      *
-     * **必须小于 [com.companion.chat.worker.ProactiveCheckWorker.PERIOD_HOURS]（2h）**，
-     * 否则「刚聊过天 → 下一个 2h 周期仍落在冷却里 → 再等 2h」会连续吞掉整轮，
-     * 实测表现为「每 2 小时一条」根本不发。冷却 1h + 周期 2h 才保证每轮都有放行机会。
+     * **注意（1.9.4.1）**：真正生效的间隔是 [ProactiveGateContext.proactiveGapMillis]（关系档随机 3~4h/2~4h/2~3h）。
+     * 关系档随机间隔**可以大于** 2h 检查周期——因为它是从"上次说话"起算，只要用户不再开口就一定会等到、不会吞轮。
+     * 这里保留 1h 仅作无关系数据时的安全默认；**改 [com.companion.chat.worker.ProactiveCheckWorker.PERIOD_HOURS] 仍必须 bump SCHEDULE_SCHEMA**。
      */
     const val COOLDOWN_MILLIS: Long = 3_600_000L
 
@@ -162,9 +168,9 @@ object ProactiveGateRules {
                 ProactiveDecision.allow()
             }
         }
-        // 3. 冷却
+        // 3. 冷却（1.9.4.1：间隔按关系档，从「上次交互」算起；默认仍是 1h）
         val last = ctx.lastInteractionMillis
-        if (last != null && ctx.nowMillis - last < COOLDOWN_MILLIS) {
+        if (last != null && ctx.nowMillis - last < ctx.proactiveGapMillis) {
             return ProactiveDecision.block(ProactiveBlockReason.COOLDOWN)
         }
         // 4. 每日上限

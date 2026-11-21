@@ -40,6 +40,11 @@ class DefaultProactiveGate(
     private val spontaneousSentTodayProvider: suspend () -> Int = { 0 },
     private val replyRateProvider: suspend () -> Double? = { null },
     private val zone: ZoneId = ZoneId.systemDefault(),
+    /**
+     * 1.9.4.1：当前关系档（生疏/熟悉/亲近）。null = 用默认 1h 冷却（旧行为，测试零改动）。
+     * 生产传 `moodService.currentRelationshipStage()`，据此把冷却换成"关系档随机间隔"。
+     */
+    private val relationshipStageProvider: suspend () -> String? = { null },
     /** 临时调试绕过（[ProactiveDebugFlags]）：生产由 CompanionApp 装配时传入，默认关闭，单测不受影响。 */
     private val debugBypass: Boolean = false,
     private val log: (String) -> Unit = { android.util.Log.w("ProactiveGate", it) }
@@ -53,11 +58,19 @@ class DefaultProactiveGate(
         }
         val cfg = configProvider()
         val sentToday = spontaneousSentTodayProvider()
+        val last = lastInteractionProvider()
+        // 1.9.4.1：关系档随机间隔（从「上次交互」算起，种子=上次交互时刻，稳定不跳）；null 档或从未交互 → 旧 1h。
+        val gap = runCatching {
+            val stage = relationshipStageProvider()
+            if (stage != null && last != null) {
+                com.companion.chat.domain.emotion.RelationshipStage.proactiveGapMillis(stage, last)
+            } else null
+        }.getOrNull() ?: ProactiveGateRules.COOLDOWN_MILLIS
         val ctx = ProactiveGateContext(
             nowMillis = now(),
             // 类别由消息类型决定（BUG-2）：环境/节日/追问不再被当闲聊吃冷却和上限
             category = category,
-            lastInteractionMillis = lastInteractionProvider(),
+            lastInteractionMillis = last,
             spontaneousSentToday = sentToday,
             dailyLimit = cfg.dailyLimit,
             replyRate7d = replyRateProvider(),
@@ -67,7 +80,8 @@ class DefaultProactiveGate(
             dndEnabled = cfg.dndEnabled,
             dndStartMinute = cfg.dndStartMinute,
             dndEndMinute = cfg.dndEndMinute,
-            enabled = cfg.enabled
+            enabled = cfg.enabled,
+            proactiveGapMillis = gap
         )
         val decision = ProactiveGateRules.evaluate(ctx, zone)
         if (!decision.allowed) {

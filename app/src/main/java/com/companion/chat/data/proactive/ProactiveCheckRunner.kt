@@ -38,15 +38,14 @@ class ProactiveCheckRunner(
     private val now: () -> Long = { System.currentTimeMillis() },
     private val log: (String) -> Unit = { android.util.Log.w("ProactiveCheck", it) },
     /**
-     * 无记忆钩子时的**兜底话题**（2026-11-21）。
+     * 无记忆钩子时的**兜底话题**（2026-11-21；1.9.4.0 改为带长期记忆 id）。
      *
-     * 背景：短期记忆是「随机关心」的唯一话题源，一旦为空（新装/清过记忆/几天没好好聊），
-     * 就会永远 NO_HOOK —— 用户看到的是「再也不主动找我」，而且完全不知道是没话题还是坏了。
-     *
-     * 返回一段 hook 文本（交给 LLM 写成自然一句话），null = 本轮确实无话可说。
-     * 生产实现：先试长期记忆（7 天内不重复），再退到「纯关心」（每天最多 1 次）。
+     * 返回 Pair(长期记忆 id, hook 文本)：id 随消息入队，供通知"别提这个"回执扣分；
+     * null = 本轮确实无话可说。若只有文本没有可用 id（纯关心），由 [plainTextFallback] 提供。
      */
-    private val recallFallback: suspend () -> String? = { null }
+    private val recallFallback: suspend () -> Pair<Long, String>? = { null },
+    /** 纯关心兜底（无关联记忆 id，不带"别提"按钮）。 */
+    private val plainTextFallback: suspend () -> String? = { null },
 ) {
 
     data class Result(val outcome: ProactiveCheckOutcome, val pendingId: Long? = null)
@@ -94,16 +93,27 @@ class ProactiveCheckRunner(
         val hookId = recallHook()
         if (hookId == null) {
             // 兜底话题（2026-11-21）：短期记忆空了也要能说句话，否则「随机关心」永远不发。
+            // 1.9.4.0：优先带 id 的长期记忆兜底（通知"别提"用）；没有则退到纯文本。
             val fallback = runCatching { recallFallback() }
                 .onFailure { log("兜底话题失败：${it.message}") }
                 .getOrNull()
-            if (fallback.isNullOrBlank()) {
+            if (fallback != null && fallback.second.isNotBlank()) {
+                val pendingId = queue.enqueue(
+                    type = PendingMessageType.CHITCHAT,
+                    content = PendingMessageContent.LongMemory(fallback.first),
+                    triggerTime = now()
+                )
+                log("投入兜底话题队列 id=$pendingId（长期记忆 ${fallback.first}）")
+                return Result(ProactiveCheckOutcome.ENQUEUED, pendingId)
+            }
+            val plain = runCatching { plainTextFallback() }.onFailure { log("纯关心兜底失败：${it.message}") }.getOrNull()
+            if (plain.isNullOrBlank()) {
                 log("无记忆钩子，跳过本轮")
                 return Result(ProactiveCheckOutcome.NO_HOOK)
             }
             val pendingId = queue.enqueue(
                 type = PendingMessageType.CHITCHAT,
-                content = PendingMessageContent.PlainText(fallback),
+                content = PendingMessageContent.PlainText(plain),
                 triggerTime = now()
             )
             log("投入兜底话题队列 id=$pendingId")

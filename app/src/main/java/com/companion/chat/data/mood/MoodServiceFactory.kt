@@ -26,6 +26,8 @@ object MoodServiceFactory {
         relationshipProvider: (suspend () -> com.companion.chat.domain.emotion.RelationshipStage.Stats?)? = null,
         /** P3：情绪事件写回长期记忆；null = 不写。 */
         memoryLongDao: com.companion.chat.data.local.dao.MemoryLongDao? = null,
+        /** 1.9.4.0：拟人化情绪记忆写入服务；非 null 时优先于 memoryLongDao 的旧逻辑。 */
+        emotionalMemory: EmotionalMemoryService? = null,
     ): MoodService {
         // 适配器：把 List<MessageEntity> 转为 callJson 需要的 List<ChatMessageDto>
         val adapter: suspend (ApiConfig, List<MessageEntity>) -> Result<String> = { config, messages ->
@@ -42,6 +44,7 @@ object MoodServiceFactory {
             followup = followup,
             relationshipProvider = relationshipProvider,
             memoryLongDao = memoryLongDao,
+            emotionalMemory = emotionalMemory,
         )
     }
 }

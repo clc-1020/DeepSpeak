@@ -55,6 +55,36 @@ class ProactiveGateRulesTest {
         assertTrue(ProactiveGateRules.evaluate(ctx, zone).allowed)
     }
 
+    // ---- 1.9.4.1：关系档自定义间隔（proactiveGapMillis）----
+
+    @Test
+    fun custom_gap_blocks_before_its_threshold() {
+        // 生疏档 3h 间隔：距上次说话 2.5h → 仍拦
+        val now = at(12, 0)
+        val ctx = ProactiveGateContext(
+            nowMillis = now,
+            lastInteractionMillis = now - (2 * hourMs + 30 * 60_000L),
+            proactiveGapMillis = 3 * hourMs
+        )
+        assertEquals(ProactiveBlockReason.COOLDOWN, ProactiveGateRules.evaluate(ctx, zone).reason)
+    }
+
+    @Test
+    fun custom_gap_allows_past_threshold() {
+        val now = at(12, 0)
+        val ctx = ProactiveGateContext(
+            nowMillis = now,
+            lastInteractionMillis = now - 3 * hourMs,
+            proactiveGapMillis = 3 * hourMs
+        )
+        assertTrue(ProactiveGateRules.evaluate(ctx, zone).allowed)
+    }
+
+    @Test
+    fun default_gap_is_one_hour() {
+        assertEquals(ProactiveGateRules.COOLDOWN_MILLIS, ProactiveGateContext(nowMillis = 0L).proactiveGapMillis)
+    }
+
     // ---------- 每日上限 ----------
 
     @Test

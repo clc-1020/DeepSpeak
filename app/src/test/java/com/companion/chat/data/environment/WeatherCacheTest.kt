@@ -244,6 +244,55 @@ class WeatherCacheTest {
         assertFalse(c.isFresh(now + 60_000L))                             // 时钟回跳 → 当过期，宁可重拉
     }
 
+    // ---------- 后台预热失败重试（1.9.3.1） ----------
+
+    @Test
+    fun retry_recovers_when_first_attempt_fails() = runBlocking {
+        enqueueJson("""{"error":true}""", code = 500) // 第一次失败
+        enqueueJson(sampleJson)                        // 第二次成功
+        val store = FakeKeyValueStore()
+
+        val bundle = cache(store).loadWithRetry(beijing, today, retryDelayMs = 0)
+
+        assertEquals(2, server.requestCount)
+        assertEquals(13, bundle.today?.tempMax)
+        assertNotNull(store.data[EnvironmentKeys.WEATHER_CACHE_JSON])
+    }
+
+    @Test
+    fun retry_stops_after_attempts_and_returns_empty() = runBlocking {
+        enqueueJson("""{"error":true}""", code = 500)
+        enqueueJson("""{"error":true}""", code = 500)
+
+        val bundle = cache(FakeKeyValueStore()).loadWithRetry(beijing, today, retryDelayMs = 0)
+
+        assertEquals(WeatherCache.DEFAULT_RETRY_ATTEMPTS, server.requestCount)
+        assertEquals(WeatherBundle.EMPTY, bundle)
+    }
+
+    @Test
+    fun retry_does_not_hit_network_when_no_coordinate() = runBlocking {
+        val bundle = cache(FakeKeyValueStore()).loadWithRetry(null, today, retryDelayMs = 0)
+
+        assertEquals(0, server.requestCount)
+        assertEquals(WeatherBundle.EMPTY, bundle)
+    }
+
+    @Test
+    fun retry_uses_cache_without_network_when_fresh() = runBlocking {
+        val store = FakeKeyValueStore(
+            mapOf(
+                EnvironmentKeys.WEATHER_CACHE_JSON to sampleJson,
+                EnvironmentKeys.WEATHER_CACHE_AT to (now - 3_600_000L).toString(),
+            )
+        )
+
+        val bundle = cache(store).loadWithRetry(beijing, today, retryDelayMs = 0)
+
+        assertEquals(0, server.requestCount)   // load() 自己命中缓存，重试分支根本不触发
+        assertEquals(13, bundle.today?.tempMax)
+    }
+
     // ---------- peek()：发送路径只读缓存，绝不联网（V2.1.8） ----------
 
     @Test

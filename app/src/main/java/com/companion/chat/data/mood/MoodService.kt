@@ -62,6 +62,8 @@ class MoodService(
      * P3：情绪事件写回长期记忆（只在亲近阶段、强度 ≥0.6）。null = 不写（旧装配/测试零改动）。
      */
     private val memoryLongDao: MemoryLongDao? = null,
+    /** 1.9.4.0：拟人化情绪记忆写入；注入了就用它（合并/pivotal/打分淘汰），否则走 1.9.3 的旧逻辑。 */
+    private val emotionalMemory: EmotionalMemoryService? = null,
 ) {
 
     /** 当前 mood（默认 normal）。 */
@@ -188,9 +190,15 @@ class MoodService(
      * 最多保留 [EmotionMemory.MAX_ENTRIES] 条（长期记忆是每轮全量注入的，攒多了会挤爆上下文）。
      */
     private suspend fun maybeWriteEmotionMemory(emotions: Map<String, Double>, trigger: String) {
-        val dao = memoryLongDao ?: return
+        if (memoryLongDao == null && emotionalMemory == null) return
         val picked = EmotionMemory.pick(emotions, currentRelationshipStage(), trigger) ?: return
         val today = todayKey()
+        // 1.9.4.0：拟人化服务接管写入（同类合并 / pivotal / 打分淘汰）。失败静默，旧数据零影响。
+        emotionalMemory?.let { svc ->
+            runCatching { svc.writeOrMerge(picked.first, picked.second, trigger, today) }
+            return
+        }
+        val dao = memoryLongDao ?: return
         val key = trigger.take(8)
         runCatching {
             val existing = dao.getByCategory(CATEGORY_EMOTION_MEMORY)

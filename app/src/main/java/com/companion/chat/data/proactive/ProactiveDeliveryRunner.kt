@@ -169,7 +169,10 @@ class ProactiveDeliveryRunner(
                 title = title,
                 body = text,
                 conversationId = convId,
-                completeMemoryId = PendingMessageContent.completeMemoryIdOrNull(msg.content),
+                // 1.9.4.0：长期记忆兜底也挂"别提"按钮（回执走 EmotionalMemoryService.dismissById）；
+                // 短期 Instruction 的既有按钮口径不变。
+                completeMemoryId = PendingMessageContent.completeMemoryIdOrNull(msg.content)
+                    ?: PendingMessageContent.longMemoryIdOrNull(msg.content),
                 // V2.2.5：追问消息把 reminderId 带到通知上供按钮回执使用。
                 // 用现成的 followupOrNull（= decode(...) as? Followup），非追问恒 null。
                 followupReminderId = PendingMessageContent.followupOrNull(msg.content)?.reminderId

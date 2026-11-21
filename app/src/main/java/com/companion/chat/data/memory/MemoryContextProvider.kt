@@ -53,13 +53,23 @@ class MemoryContextProvider(
          * 阈值只能靠真机分数分布来定，拍脑袋改只会来回试。
          */
         onDiagnostics: ((String) -> Unit)? = null,
+        /**
+         * 1.9.4.0：本轮筛选出的情绪回忆候选正文（已经过冷却/情绪加权，最多 2 条）。
+         * 并进 long 列表一起按预算截断；空 = 本轮没有可回忆的情绪记忆。
+         */
+        emotional: List<String> = emptyList(),
     ): String? = runCatching {
         if (budgetChars <= 0) return null
 
         // 本轮的查询向量只算一次，短期与日记共用
         val query = queryVector(userText)
         val short = if (query != null) shortEntries(query) else emptyList()
-        val long = runCatching { longDao.getAll().map { it.content } }.getOrDefault(emptyList())
+        // 1.9.4.0：情绪记忆（intensity>0）不再随 long 全量注入，只走 emotional 候选（已过冷却/情绪筛选）。
+        // ⚠️ 1.9.4.1 修复：情绪候选必须放在普通长期记忆**前面**——MemoryContextBlock 对 long 做
+        // distinct().take(LONG_LIMIT=12)，追加在末尾会在普通记忆 ≥12 条时被静默切掉（功能无声失效）。
+        val long = emotional + runCatching {
+            longDao.getAll().filter { it.intensity <= 0.0 }.map { it.content }
+        }.getOrDefault(emptyList())
         val daily = dailyEntries(query)
 
         onDiagnostics?.invoke(diagnostics(short, daily, query != null))
