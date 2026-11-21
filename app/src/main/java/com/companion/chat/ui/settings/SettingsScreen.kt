@@ -1,19 +1,28 @@
 package com.companion.chat.ui.settings
 
 import android.widget.Toast
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.companion.chat.R
 import com.companion.chat.data.environment.CityGeocoder
 import com.companion.chat.data.environment.GeocodeOutcome
 import com.companion.chat.data.environment.LocationCache
@@ -673,6 +682,36 @@ fun SettingsScreen(
             // 可点开浏览器（Data 的 UriHandler 打开系统浏览器）
             TextButton(onClick = { uriHandler.openUri("https://open-meteo.com") }) {
                 Text("访问 Open-Meteo")
+            }
+
+            // ---- 赞助（收款码）：正文之后、保存之前（习惯：正文 → 赞助 → 保存）----
+            // 图放 res/drawable-nodpi/：二维码不能被密度缩放重采样，糊了就扫不出来。
+            // 图已裁成只剩二维码本体（560×560，含安静区），不含顶部绿色标题与姓名。
+            Spacer(Modifier.height(24.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            )
+            Spacer(Modifier.height(16.dp))
+            Text(
+                "作者还是个穷学生，用ai写代码很烧钱的，能不能请作者喝杯奶茶，或者给大肥鱼喂些米呢？",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(12.dp))
+            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Image(
+                    painter = painterResource(id = R.drawable.img_footer),
+                    contentDescription = "作者收款码（微信支付）",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxWidth(0.62f)
+                        .clip(RoundedCornerShape(12.dp))
+                )
             }
 
             Spacer(Modifier.height(8.dp))
