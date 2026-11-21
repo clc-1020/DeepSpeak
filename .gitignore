@@ -79,3 +79,6 @@ hs_err_pid*.log
 /CAPABILITY_MATRIX.md
 /output_layer_paths.md
 /refusal_probe_template.md
+
+# 节日生成器的编译产物
+/tools/genfestivals/out/
