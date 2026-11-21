@@ -1,10 +1,6 @@
 # DeepSpeak（深语）· 「她」
 
 > 一个**纯客户端**的安卓 AI 陪伴应用：你自己填 API Key，她自己记住你、到点提醒你、主动找你说话，并且**有情绪、有关系、会想你**。
->
-> 名字向 [DeepSeek](https://www.deepseek.com/) 的蓝鲸致敬：**DeepSpeak = Deep + Speak**（也谐音 DeepSeek）。本项目为**个人作品，非 DeepSeek 官方产品**。
->
-> 当前版本 **1.6.1（versionCode 45）** ｜ 单元测试 **998 / 122 suite / 0 失败** ｜ Android 8.0+（minSdk 26，targetSdk 34）
 
 ---
 
