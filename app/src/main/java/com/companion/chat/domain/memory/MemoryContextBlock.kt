@@ -56,6 +56,13 @@ object MemoryContextBlock {
     private const val HEADER = "【我记得的事】相关就自然提一句，不相关别硬提、别罗列。"
 
     /**
+     * 深度回忆轮的轻提示（2026-11-22）。约 40 字，只在这些轮次出现（尾部，不进稳定前缀）。
+     * 核心是"**翻不到就认、别编**" —— 比"翻得到"更能决定她像不像真人。
+     */
+    const val RECALL_NOTE =
+        "（这轮在问过去的事：记得就自然说起，不记得就说记不清，别编具体的日期/地点/经过。）"
+
+    /**
      * @param short 短期候选，**调用方应已按 score 降序**排好
      * @param long 长期记忆正文（未去重，本函数会去重）
      * @param daily 日记（调用方已按日期降序，最多取 [DAILY_DAYS] 天）
@@ -71,6 +78,12 @@ object MemoryContextBlock {
         longLimit: Int = LONG_LIMIT,
         dailyDays: Int = DAILY_DAYS,
         threshold: Float = SIMILARITY_THRESHOLD,
+        /**
+         * 深度回忆轮附带的轻提示（2026-11-22）。null = 普通轮（不出现）。
+         * 只在命中「记不记得/上次」的轮次由 Provider 传入，**不进稳定前缀**（放尾部）。
+         * 即便这轮一条记忆都没匹配上，也会单独返回这句，让模型诚实说"记不清"而不是瞎编。
+         */
+        recallNote: String? = null,
     ): String? {
         if (budgetChars <= 0) return null
         if (budgetChars <= HEADER.length) return null
@@ -102,12 +115,22 @@ object MemoryContextBlock {
         if (shortKept.isNotEmpty()) parts[SECTION_SHORT] = "- 最近：" + shortKept.joinToString("；")
         if (longKept.isNotEmpty()) parts[SECTION_LONG] = "- 关于你：" + longKept.joinToString("；")
         if (dailyKept.isNotEmpty()) parts[SECTION_DAILY] = "- 前几天：" + dailyKept.joinToString("；")
-        if (parts.isEmpty()) return null
+        if (parts.isEmpty()) {
+            // 普通轮：没内容就一个字都不注入（省 token，铁律 1）。
+            // 深度回忆轮：哪怕没匹配到任何记忆，也要返回那句"记不清别编"的提示 —— 这正是坑2要的效果。
+            return recallNote?.trim()?.takeIf { it.isNotEmpty() }
+        }
 
-        fun assemble(): String =
-            HEADER + "\n" + listOfNotNull(
-                parts[SECTION_SHORT], parts[SECTION_LONG], parts[SECTION_DAILY]
-            ).joinToString("\n")
+        fun assemble(): String = buildString {
+            append(HEADER)
+            if (!recallNote.isNullOrBlank()) append("\n").append(recallNote.trim())
+            append("\n")
+            append(
+                listOfNotNull(
+                    parts[SECTION_SHORT], parts[SECTION_LONG], parts[SECTION_DAILY]
+                ).joinToString("\n")
+            )
+        }
 
         // 按「最可替代 → 最不该丢」的顺序整段丢弃
         val dropOrder = listOf(SECTION_DAILY, SECTION_SHORT, SECTION_LONG)

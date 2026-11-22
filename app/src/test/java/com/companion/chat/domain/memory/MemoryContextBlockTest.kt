@@ -232,4 +232,39 @@ class MemoryContextBlockTest {
         assertEquals("每5分钟提醒一次背单词", out[0])
         assertEquals("提醒我喝水", out[1])
     }
+
+    // ---- 2026-11-22：深度回忆轮附带"记不清别编"的提示 ----
+
+    @Test
+    fun recall_note_is_attached_on_recall_turn() {
+        val block = MemoryContextBlock.build(
+            short = listOf(short("用户明天面试", 0.9f)),
+            long = emptyList(),
+            daily = emptyList(),
+            budgetChars = 2000,
+            recallNote = MemoryContextBlock.RECALL_NOTE
+        )!!
+        assertTrue("深度回忆轮要带上提示", block.contains(MemoryContextBlock.RECALL_NOTE))
+        // 头一行仍是原来的 header，不被提示打乱（保证 header 压缩规则不被破坏）
+        assertEquals("【我记得的事】相关就自然提一句，不相关别硬提、别罗列。", block.substringBefore("\n"))
+    }
+
+    @Test
+    fun recall_note_returned_even_when_nothing_matched() {
+        // 坑2：翻不到也要把"记不清别编"的提示递过去，而不是返回 null 什么都不说
+        val out = MemoryContextBlock.build(
+            short = emptyList(),
+            long = emptyList(),
+            daily = emptyList(),
+            budgetChars = 1000,
+            recallNote = MemoryContextBlock.RECALL_NOTE
+        )
+        assertEquals(MemoryContextBlock.RECALL_NOTE, out)
+    }
+
+    @Test
+    fun normal_turn_without_content_still_returns_null() {
+        // 普通轮（无 recallNote）没内容 → 仍然一个字都不注入
+        assertNull(MemoryContextBlock.build(emptyList(), emptyList(), emptyList(), budgetChars = 1000))
+    }
 }

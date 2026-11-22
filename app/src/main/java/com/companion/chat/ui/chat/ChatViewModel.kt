@@ -20,6 +20,7 @@ import com.companion.chat.data.remote.UsageInfo
 import com.companion.chat.data.remote.dto.ChatMessageDto
 import com.companion.chat.domain.ConversationDeletionPolicy
 import com.companion.chat.domain.ContextBuilder
+import com.companion.chat.domain.memory.RecallTriggerDetector
 import com.companion.chat.domain.emotion.EmotionKaomoji
 import com.companion.chat.domain.UserMetaMarker
 import com.companion.chat.domain.environment.WeatherSummary
@@ -431,6 +432,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun prefetchEmbedding() {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { appContainer.ensureEmbeddingService() }
+            // 2026-11-22：模型就绪后顺手整理一次历史长期记忆（合并重复 + 给旧记录补向量）。
+            // 幂等（没有重复就返回 0），失败静默，绝不影响聊天。修手动加记忆遗留的重复项。
+            runCatching {
+                val merged = appContainer.memoryDeduplicator.consolidatePlainLong()
+                if (merged > 0) {
+                    android.util.Log.w("MemoryDedup", "启动整理：合并删除 $merged 条重复长期记忆")
+                }
+            }
         }
     }
 
@@ -453,6 +462,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // 预算取上下文窗口的 12%（≈ token），由 ContextTrimmer 之外的独立额度控制 ——
         // 记忆块自己先按预算裁好，避免把对话历史挤掉。没相关记忆时返回 null，一个字都不加。
         val memoryDiag = StringBuilder()
+        // 2026-11-22 深度回忆：命中「记不记得 / 我上次 / 之前说的」等**过去回忆词**（且开关打开）时，
+        // 让 App 放宽窗口/阈值多翻一遍记忆。未来/待办句（"明天要开会"）由检测器排除，不会误触发。
+        val deepRecall = runCatching {
+            RecallTriggerDetector.detect(currentUser.content).triggered &&
+                configRepository.getDeepRecallEnabled()
+        }.getOrDefault(false)
         // 1.9.4.0：情绪回忆按需筛选（冷却 + 情绪加权 + boost tiebreaker），注入后逐条记账。
         val emotionalCandidates = runCatching {
             val st = appContainer.moodService.currentEmotionState()
@@ -462,8 +477,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val memoryBlock = runCatching {
             appContainer.memoryContextProvider.build(
                 userText = currentUser.content,
-                budgetChars = (effectiveConfig.contextWindow * MEMORY_CONTEXT_RATIO).toInt(),
+                // 深度回忆轮给更大记忆预算（18%），平时 12%
+                budgetChars = (effectiveConfig.contextWindow *
+                    (if (deepRecall) MEMORY_CONTEXT_RATIO_RECALL else MEMORY_CONTEXT_RATIO)).toInt(),
                 emotional = emotionalCandidates.map { it.second },
+                recallMode = deepRecall,
                 // 2026-11-21：把每条候选的相似度分数打出来 —— 调阈值时只能靠这个，不能靠猜
                 onDiagnostics = { memoryDiag.append(it) }
             )
@@ -478,7 +496,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
         // W 级（真机 D 级常被 ROM 吞）：用来核对「这轮到底注入了多少字记忆」+ 每条分数，
         // 0 = 没有相关记忆（正常，说明省 token 路径生效）
-        android.util.Log.w("MemoryCtx", "本轮注入记忆块 ${memoryBlock?.length ?: 0} 字｜$memoryDiag")
+        android.util.Log.w(
+            "MemoryCtx",
+            "本轮注入记忆块 ${memoryBlock?.length ?: 0} 字${if (deepRecall) "[深度回忆]" else ""}｜$memoryDiag"
+        )
         // 2026-11-21 情绪系统 P1：尾部状态块（情绪 → 记忆）。它只改"她怎么说"，所以永远注入，
         // 不参与记忆块的 12% 预算；自身长度由 EmotionPhrase 控制在 ~70 字。
         val emotionBlock = runCatching { appContainer.moodService.renderEmotionBlock() }.getOrNull()
@@ -739,5 +760,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
          * 调高会把对话历史挤掉，调低则长期记忆经常被砍到空 —— 两个方向都写进过事故。
          */
         private const val MEMORY_CONTEXT_RATIO = 0.12
+
+        /**
+         * 深度回忆轮的记忆预算比例（2026-11-22）。
+         * 放宽召回要多装几条记忆，所以这档给到 18%（普通轮 12%）；只作用于命中回忆词的轮次。
+         */
+        private const val MEMORY_CONTEXT_RATIO_RECALL = 0.18
     }
 }

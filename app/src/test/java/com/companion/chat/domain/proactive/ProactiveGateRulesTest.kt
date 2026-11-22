@@ -352,4 +352,71 @@ class ProactiveGateRulesTest {
         val ctx = ProactiveGateContext(nowMillis = at(20, 0), spontaneousSentToday = 3, dailyLimit = 3)
         assertFalse(ProactiveGateRules.evaluate(ctx, zone).allowed)
     }
+
+    // ---- 1.9.4.2：冷却锚点 = max(用户说话, 她上次主动送达) ----
+
+    /**
+     * 核心回归：用户沉默很久（单看过旧的「用户说话」锚点会放行），
+     * 但她 1h 前刚主动送达过一条 → 应按 3h 间隔拦住，不能每 2h 又发。
+     * （1.9.4.1 的 bug：主动送达不更新锚点，导致这条会放行 → 退化成每 2h 一条。）
+     */
+    @Test
+    fun recent_proactive_send_blocks_even_when_user_silent_long() {
+        val now = at(12, 0)
+        val ctx = ProactiveGateContext(
+            nowMillis = now,
+            lastInteractionMillis = now - 10 * hourMs,
+            lastProactiveAtMillis = now - 1 * hourMs,
+            proactiveGapMillis = 3 * hourMs
+        )
+        assertEquals(ProactiveBlockReason.COOLDOWN, ProactiveGateRules.evaluate(ctx, zone).reason)
+    }
+
+    /** 她 4h 前主动送达、间隔 3h → 已超，允许再次主动找（沉默期也能按随机节奏继续发）。 */
+    @Test
+    fun allows_when_proactive_anchor_past_gap() {
+        val now = at(12, 0)
+        val ctx = ProactiveGateContext(
+            nowMillis = now,
+            lastInteractionMillis = now - 10 * hourMs,
+            lastProactiveAtMillis = now - 4 * hourMs,
+            proactiveGapMillis = 3 * hourMs
+        )
+        assertTrue(ProactiveGateRules.evaluate(ctx, zone).allowed)
+    }
+
+    /** 从没有过用户消息，但她 30 分钟前主动送达过、兜底间隔 1h → 拦（不会因"没用户消息"就跳过冷却）。 */
+    @Test
+    fun proactive_anchor_applies_when_no_user_message() {
+        val now = at(12, 0)
+        val ctx = ProactiveGateContext(
+            nowMillis = now,
+            lastInteractionMillis = null,
+            lastProactiveAtMillis = now - 30 * 60_000L
+        )
+        assertEquals(ProactiveBlockReason.COOLDOWN, ProactiveGateRules.evaluate(ctx, zone).reason)
+    }
+
+    /** 两个锚点都为 null（全新用户）→ 跳过冷却。 */
+    @Test
+    fun no_anchor_at_all_not_blocked_by_cooldown() {
+        val ctx = ProactiveGateContext(
+            nowMillis = at(12, 0),
+            lastInteractionMillis = null,
+            lastProactiveAtMillis = null
+        )
+        assertTrue(ProactiveGateRules.evaluate(ctx, zone).allowed)
+    }
+
+    /** 锚点取较晚者：用户 5h 前说话、她 1h 前送达 → 锚点应为 1h 前那次。 */
+    @Test
+    fun cooldown_anchor_picks_later_of_user_and_proactive() {
+        val now = at(12, 0)
+        val ctx = ProactiveGateContext(
+            nowMillis = now,
+            lastInteractionMillis = now - 5 * hourMs,
+            lastProactiveAtMillis = now - 1 * hourMs
+        )
+        assertEquals(now - 1 * hourMs, ProactiveGateRules.cooldownAnchorMillis(ctx))
+    }
 }

@@ -27,7 +27,18 @@ class MemoryDeduplicator(
     private val shortDao: MemoryShortDao,
     private val longDao: MemoryLongDao,
     private val embeddingProvider: suspend () -> EmbeddingService,
+    /**
+     * **短期**记忆合并阈值（0.85）。⚠️ 不要调低到 0.85 以下——短期记忆是「可执行的任务/待办」
+     * （明天面试、7点叫我吃药、监督我背单词），误合并会直接丢一个提醒/一件事（「7点吃药」和「8点吃药」
+     * 余弦≈0.9，一降就并掉），比"重复"危害大得多。真遇同义漏并，改 [longThreshold]，别动这里。
+     */
     private val threshold: Float = 0.85f,
+    /**
+     * 长期记忆合并阈值（2026-11-22）。**故意比短期(0.85)低**：真机实测「用户说有一家糖水店的绿豆汤很好喝」
+     * 与「用户喜欢一家糖水店的绿豆汤，但店名和具体街道记不清了」余弦只有 0.84（同一件事、换了个说法），
+     * 卡在 0.85 上不合并 → 长期记忆越攒越多。0.80 能并掉这类同义句，而无关事实（实测 0.36 左右）离得远，安全。
+     */
+    private val longThreshold: Float = 0.80f,
     private val now: () -> Long = { System.currentTimeMillis() }
 ) {
 
@@ -73,13 +84,21 @@ class MemoryDeduplicator(
         return 1
     }
 
-    /** 长期记忆 upsert（只在同 category 内比较）。返回 1=新增，0=合并/跳过。 */
+    /**
+     * 长期记忆 upsert。返回 1=新增，0=合并/跳过。
+     *
+     * 2026-11-22 修复：以前**只在同 category 内比较** → 「用户说X很好喝(fact)」和「用户喜欢喝X(preference)」
+     * 明明同义却因类别不同永不合并（真机踩到）。现改为**跨类别比较**，只保留一条安全护栏：
+     * **allergy（过敏/忌口）不与其它类别互相合并**——避免把「对花生过敏」并成「不喜欢花生」而丢过敏事实；
+     * 合并时保留 `best` 原 category，过敏安全信息不会被降级。
+     */
     suspend fun upsertLong(content: String, category: String): Int {
         val c = content.trim()
         if (c.isEmpty()) return 0
         // category 先归一（中英文/拼写变体 → 固定枚举），避免碎片化导致漏去重
         val cat = com.companion.chat.domain.memory.MemoryCategory.normalize(category)
-        val all = longDao.getAll().filter { com.companion.chat.domain.memory.MemoryCategory.normalize(it.category) == cat }
+        val all = longDao.getAll()
+        val newIsAllergy = cat == com.companion.chat.domain.memory.MemoryCategory.ALLERGY
         val emb = embedOrNull(c)
 
         if (emb == null) {
@@ -91,6 +110,9 @@ class MemoryDeduplicator(
         var best: MemoryLongEntity? = null
         var bestSim = -1f
         for (m in all) {
+            val mcat = com.companion.chat.domain.memory.MemoryCategory.normalize(m.category)
+            // 过敏与非过敏不互相合并（安全护栏）
+            if ((mcat == com.companion.chat.domain.memory.MemoryCategory.ALLERGY) != newIsAllergy) continue
             var v = bytesToVec(m.embedding)
             if (v == null) {
                 v = embedOrNull(m.content)
@@ -104,7 +126,7 @@ class MemoryDeduplicator(
         }
 
         val newBytes = FloatArrayCodec.toBytes(emb)
-        if (best != null && bestSim >= threshold) {
+        if (best != null && bestSim >= longThreshold) {
             longDao.update(best.copy(content = c, createTime = now(), embedding = newBytes))
             return 0
         }
@@ -112,6 +134,64 @@ class MemoryDeduplicator(
             MemoryLongEntity(content = c, category = cat, createTime = now(), embedding = newBytes)
         )
         return 1
+    }
+
+    /**
+     * 一次性整理：把已有的「普通长期记忆」（intensity<=0，**不动情绪记忆**）里互相重复的合并掉，
+     * 并给缺向量的旧记录补算向量（否则它们永远无法参与语义去重/召回）。
+     *
+     * 2026-11-22 新增：修「历史上因『手动加记忆不走向量/去重』+『跨类别不比较』而残留的重复项」。
+     * 每对同义（cos>=threshold 且不违反过敏护栏）只保留**内容更长**的那条，删掉另一条。幂等：
+     * 没有重复时返回 0；情绪记忆（intensity>0）完全不碰（那是另一套子系统）。
+     *
+     * @return 被合并删除的条数
+     */
+    suspend fun consolidatePlainLong(threshold: Float = this.longThreshold): Int {
+        val all = runCatching { longDao.getAll() }.getOrDefault(emptyList())
+            .filter { it.intensity <= 0.0 }
+        if (all.size < 2) {
+            all.forEach { backfillVector(it) }
+            return 0
+        }
+
+        val vec = HashMap<Long, FloatArray?>()
+        all.forEach { m -> vec[m.id] = backfillVector(m) }
+
+        val removed = HashSet<Long>()
+        val order = all.sortedByDescending { it.content.length } // 内容更长的优先保留
+        var merged = 0
+        for (i in order.indices) {
+            val a = order[i]
+            if (a.id in removed) continue
+            val va = vec[a.id] ?: continue
+            val aIsAllergy =
+                com.companion.chat.domain.memory.MemoryCategory.normalize(a.category) ==
+                    com.companion.chat.domain.memory.MemoryCategory.ALLERGY
+            for (j in i + 1 until order.size) {
+                val b = order[j]
+                if (b.id in removed) continue
+                val bIsAllergy =
+                    com.companion.chat.domain.memory.MemoryCategory.normalize(b.category) ==
+                        com.companion.chat.domain.memory.MemoryCategory.ALLERGY
+                if (aIsAllergy != bIsAllergy) continue // 过敏护栏
+                val vb = vec[b.id] ?: continue
+                val sim = runCatching { VectorMath.cosineSimilarity(va, vb) }.getOrNull() ?: continue
+                if (sim >= threshold) {
+                    longDao.delete(b)
+                    removed.add(b.id)
+                    merged++
+                }
+            }
+        }
+        return merged
+    }
+
+    /** 旧记录若无向量则补算并落库；返回其向量（失败/模型未就绪返回 null）。 */
+    private suspend fun backfillVector(m: MemoryLongEntity): FloatArray? {
+        bytesToVec(m.embedding)?.let { return it }
+        val v = embedOrNull(m.content) ?: return null
+        runCatching { longDao.update(m.copy(embedding = FloatArrayCodec.toBytes(v))) }
+        return v
     }
 
     private fun bytesToVec(b: ByteArray?): FloatArray? =

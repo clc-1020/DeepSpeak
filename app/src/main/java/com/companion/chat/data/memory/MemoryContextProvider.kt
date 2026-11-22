@@ -29,6 +29,12 @@ import com.companion.chat.domain.memory.MemoryContextBlock
  *    长期/日记是稳定内容，照常注入。
  *  - 单条记忆算相似度失败 → 该条跳过。
  *  - 整体异常 → 返回 null（= 本轮不注入记忆）。
+ *
+ * 深度回忆（2026-11-22，[build] 的 `recallMode`）：
+ *  命中「记不记得/上次」这类明确过去回忆词时，普通轮"跟这句话像不像"的召回会失准
+ *  （问句本身很空，相似度低于阈值 → 召不回）。于是放宽：日记窗口 3→14 天、短期阈值 0.45→0.32、
+ *  短期名额 4→6；第一档**一条都没过线**再放到"全部日记（限 [RECALL_DAILY_MAX] 天）+ 阈值 0.28"。
+ *  ⚠️ 翻不到时**不塞"最近+重要度"凑数**，只由 [MemoryContextBlock.RECALL_NOTE] 让模型坦白记不清。
  */
 class MemoryContextProvider(
     private val shortDao: MemoryShortDao,
@@ -41,7 +47,8 @@ class MemoryContextProvider(
     /**
      * @param userText 本轮用户输入（算相似度用）
      * @param budgetChars 这段文本允许占用的字符数（≈ token）
-     * @return 可注入的文本；无内容 → null
+     * @param recallMode 深度回忆（2026-11-22）：命中过去回忆词时为 true，放宽窗口/阈值多翻一遍。
+     * @return 可注入的文本；无内容 → null（深度回忆轮即便无匹配也会返回"记不清别编"的提示）
      */
     suspend fun build(
         userText: String,
@@ -58,6 +65,8 @@ class MemoryContextProvider(
          * 并进 long 列表一起按预算截断；空 = 本轮没有可回忆的情绪记忆。
          */
         emotional: List<String> = emptyList(),
+        /** 深度回忆模式（见类注释）；仅命中过去回忆词且开关打开时为 true。 */
+        recallMode: Boolean = false,
     ): String? = runCatching {
         if (budgetChars <= 0) return null
 
@@ -70,24 +79,59 @@ class MemoryContextProvider(
         val long = emotional + runCatching {
             longDao.getAll().filter { it.intensity <= 0.0 }.map { it.content }
         }.getOrDefault(emptyList())
-        val daily = dailyEntries(query)
 
-        onDiagnostics?.invoke(diagnostics(short, daily, query != null))
+        // 日记窗口：普通轮只扫近 3 天；深度回忆先扫到 RECALL_DAILY_MAX 天（下面再按档位截）。
+        val dailyScanLimit = if (recallMode) RECALL_DAILY_MAX else MemoryContextBlock.DAILY_DAYS
+        val daily = dailyEntries(query, dailyScanLimit)
 
-        MemoryContextBlock.build(short = short, long = long, daily = daily, budgetChars = budgetChars)
+        // 定阈值 / 名额 / 日记天数（普通轮固定；深度回忆两档渐进放宽）
+        val threshold: Float
+        val shortLimit: Int
+        val dailyDays: Int
+        if (recallMode) {
+            val stage1Pass = short.count { it.score != null && it.score >= RECALL_THRESHOLD_STAGE1 } +
+                daily.take(RECALL_STAGE1_DAYS).count { it.score != null && it.score >= RECALL_THRESHOLD_STAGE1 }
+            if (stage1Pass == 0) {
+                // 第一档啥都没捞到 → 放到"全部日记 + 更低阈值"再翻一次
+                threshold = RECALL_THRESHOLD_STAGE2
+                dailyDays = RECALL_DAILY_MAX
+            } else {
+                threshold = RECALL_THRESHOLD_STAGE1
+                dailyDays = RECALL_STAGE1_DAYS
+            }
+            shortLimit = RECALL_SHORT_LIMIT
+        } else {
+            threshold = MemoryContextBlock.SIMILARITY_THRESHOLD
+            shortLimit = MemoryContextBlock.SHORT_LIMIT
+            dailyDays = MemoryContextBlock.DAILY_DAYS
+        }
+
+        onDiagnostics?.invoke(diagnostics(short, daily.take(dailyDays), query != null, threshold))
+
+        MemoryContextBlock.build(
+            short = short,
+            long = long,
+            daily = daily,
+            budgetChars = budgetChars,
+            shortLimit = shortLimit,
+            dailyDays = dailyDays,
+            threshold = threshold,
+            recallNote = if (recallMode) MemoryContextBlock.RECALL_NOTE else null,
+        )
     }.getOrNull()
 
-    /** 分数快照：短期前 6 条 / 日记全部 / 阈值；embedding 未就绪时显式说明。 */
+    /** 分数快照：短期前 6 条 / 日记（按档位） / 阈值；embedding 未就绪时显式说明。 */
     private fun diagnostics(
         short: List<MemoryContextBlock.ShortEntry>,
         daily: List<MemoryContextBlock.DailyEntry>,
         embeddingReady: Boolean,
+        threshold: Float,
     ): String {
         if (!embeddingReady) return "向量未就绪（短期与日记都不注入）"
         fun f(v: Float?) = v?.let { String.format(java.util.Locale.US, "%.2f", it) } ?: "--"
         val s = short.take(6).joinToString(" ") { "${f(it.score)}|${it.text.take(8)}" }
         val d = daily.joinToString(" ") { "${f(it.score)}|${it.date}" }
-        return "短期[$s] 日记[$d] 阈值${MemoryContextBlock.SIMILARITY_THRESHOLD}"
+        return "短期[$s] 日记[$d] 阈值$threshold"
     }
 
     /** 用户输入 → 向量；模型未就绪/空输入 → null（此时短期与日记都不注入）。 */
@@ -126,15 +170,20 @@ class MemoryContextProvider(
     }
 
     /**
-     * 近 3 天日记 + 每天的**相似度**（2026-11-21 用户要求：相关才注入）。
+     * 日记（按日期降序取前 [limit] 天）+ 每天的**相似度**（2026-11-21 用户要求：相关才注入）。
      *
      * 向量用展平后的正文（`readableDailyEvents`）算 —— 与最终注入的文本一致，
      * 否则 JSON 引号/逗号会稀释语义。query 为 null（模型未就绪）→ score 全 null → 不注入。
+     *
+     * @param limit 扫描天数。普通轮只扫近 3 天（省钱省时）；深度回忆轮扫到 [RECALL_DAILY_MAX] 天。
      */
-    private suspend fun dailyEntries(query: FloatArray?): List<MemoryContextBlock.DailyEntry> {
+    private suspend fun dailyEntries(
+        query: FloatArray?,
+        limit: Int = MemoryContextBlock.DAILY_DAYS,
+    ): List<MemoryContextBlock.DailyEntry> {
         val rows = runCatching { dailyDao.getAll() }.getOrDefault(emptyList())
             .sortedByDescending { it.date }
-            .take(MemoryContextBlock.DAILY_DAYS)
+            .take(limit)
 
         val svc = if (query != null) runCatching { embedding() }.getOrNull() else null
         return rows.map { row ->
@@ -148,5 +197,25 @@ class MemoryContextProvider(
             }
             MemoryContextBlock.DailyEntry(row.date, row.events, sim)
         }
+    }
+
+    companion object {
+        /** 深度回忆第一档：日记扫描/截取天数（≈ 两周）。 */
+        private const val RECALL_STAGE1_DAYS = 14
+
+        /**
+         * 深度回忆第二档最多扫多少天日记（≈ 半年）。
+         * 设上限是为了防止"日记攒了好几年"时一次全量 embedding 卡住首字；够长了，代价可控。
+         */
+        private const val RECALL_DAILY_MAX = 180
+
+        /** 第一档相似度阈值（比普通 0.45 松，问句再空也能捞到一些）。 */
+        private const val RECALL_THRESHOLD_STAGE1 = 0.32f
+
+        /** 第二档相似度阈值（第一档全落空才降到这；再低就离题了）。 */
+        private const val RECALL_THRESHOLD_STAGE2 = 0.28f
+
+        /** 深度回忆短期名额（比普通 4 条多给两条）。 */
+        private const val RECALL_SHORT_LIMIT = 6
     }
 }

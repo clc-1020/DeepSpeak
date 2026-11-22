@@ -45,6 +45,11 @@ class DefaultProactiveGate(
      * 生产传 `moodService.currentRelationshipStage()`，据此把冷却换成"关系档随机间隔"。
      */
     private val relationshipStageProvider: suspend () -> String? = { null },
+    /**
+     * 1.9.4.2：上一条主动消息送达时刻（app_state[KEY_PROACTIVE_LAST_DELIVERED]）。
+     * 与 [lastInteractionProvider] 一起构成冷却锚点（取较晚者），修"沉默时随机间隔失效"。
+     */
+    private val lastProactiveAtProvider: suspend () -> Long? = { null },
     /** 临时调试绕过（[ProactiveDebugFlags]）：生产由 CompanionApp 装配时传入，默认关闭，单测不受影响。 */
     private val debugBypass: Boolean = false,
     private val log: (String) -> Unit = { android.util.Log.w("ProactiveGate", it) }
@@ -58,19 +63,28 @@ class DefaultProactiveGate(
         }
         val cfg = configProvider()
         val sentToday = spontaneousSentTodayProvider()
-        val last = lastInteractionProvider()
-        // 1.9.4.1：关系档随机间隔（从「上次交互」算起，种子=上次交互时刻，稳定不跳）；null 档或从未交互 → 旧 1h。
+        val lastUser = lastInteractionProvider()
+        val lastProactive = lastProactiveAtProvider()
+        // 1.9.4.2：锚点取「用户上次说话」与「她上次主动送达」较晚者——
+        // 否则她主动发过一条后锚点不动，随机间隔只在用户每说一句话后生效一次、之后退化成每2h一条。
+        val anchor = when {
+            lastUser == null -> lastProactive
+            lastProactive == null -> lastUser
+            else -> maxOf(lastUser, lastProactive)
+        }
+        // 关系档随机间隔（种子=锚点，同一段互动内稳定不跳）；null 档或从无锚点 → 旧 1h。
         val gap = runCatching {
             val stage = relationshipStageProvider()
-            if (stage != null && last != null) {
-                com.companion.chat.domain.emotion.RelationshipStage.proactiveGapMillis(stage, last)
+            if (stage != null && anchor != null) {
+                com.companion.chat.domain.emotion.RelationshipStage.proactiveGapMillis(stage, anchor)
             } else null
         }.getOrNull() ?: ProactiveGateRules.COOLDOWN_MILLIS
         val ctx = ProactiveGateContext(
             nowMillis = now(),
             // 类别由消息类型决定（BUG-2）：环境/节日/追问不再被当闲聊吃冷却和上限
             category = category,
-            lastInteractionMillis = last,
+            lastInteractionMillis = lastUser,
+            lastProactiveAtMillis = lastProactive,
             spontaneousSentToday = sentToday,
             dailyLimit = cfg.dailyLimit,
             replyRate7d = replyRateProvider(),
@@ -86,8 +100,7 @@ class DefaultProactiveGate(
         val decision = ProactiveGateRules.evaluate(ctx, zone)
         if (!decision.allowed) {
             // 用 W 级：真机上 D 级日志常被 ROM 吞掉，排查「为什么不发」全靠这行
-            val last = ctx.lastInteractionMillis
-            val sinceLastMin = if (last != null) (ctx.nowMillis - last) / 60_000 else null
+            val sinceLastMin = if (anchor != null) (ctx.nowMillis - anchor) / 60_000 else null
             log(
                 "Blocked=${decision.reason} sentToday=$sentToday/${cfg.dailyLimit} " +
                     "sinceLastInteraction=${sinceLastMin}min category=${ctx.category}"

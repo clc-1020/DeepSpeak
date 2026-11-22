@@ -71,4 +71,17 @@ class NotificationActionsTest {
         assertEquals(2, plan.size)
         assertNotEquals(plan[0].requestCode, plan[1].requestCode)
     }
+
+    /** 1.9.4.2：长期记忆兜底 → 只有「别提这个」一个按钮（DISMISS），不带完成。 */
+    @Test
+    fun dismiss_long_id_produces_single_dismiss() {
+        val plan = NotificationActions.planFor(
+            notificationId = 1,
+            completeMemoryId = null,
+            followupReminderId = null,
+            dismissLongMemoryId = 77L
+        )
+        assertEquals(1, plan.size)
+        assertEquals(NotificationActionKind.DISMISS, plan[0].kind)
+    }
 }

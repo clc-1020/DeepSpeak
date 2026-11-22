@@ -132,6 +132,17 @@ class ConfigRepository(context: Context) {
     fun setQuickAccessEnabled(enabled: Boolean) =
         prefs.edit().putBoolean(KEY_QUICK_ACCESS_ENABLED, enabled).apply()
 
+    // ---------- 深度回忆（2026-11-22） ----------
+
+    /**
+     * 深度回忆开关（默认开）。
+     * 开启后：用户说「你还记不记得…」「我上次…」这类**过去回忆**时，App 会专门多翻一遍记忆。
+     * 命中才跑，平时零额外成本；嫌费 token 的可以关掉。
+     */
+    fun getDeepRecallEnabled(): Boolean = prefs.getBoolean(KEY_DEEP_RECALL, true)
+    fun setDeepRecallEnabled(enabled: Boolean) =
+        prefs.edit().putBoolean(KEY_DEEP_RECALL, enabled).apply()
+
     // ---------- 主动消息语音 + 勿扰（任务 4.3） ----------
 
     /** 主动消息自动语音开关（默认关）。 */
@@ -277,6 +288,7 @@ class ConfigRepository(context: Context) {
         private const val KEY_TTS_ENABLED = "tts_enabled"
         private const val KEY_STT_ENABLED = "stt_enabled"
         private const val KEY_QUICK_ACCESS_ENABLED = "quick_access_enabled"
+        private const val KEY_DEEP_RECALL = "deep_recall_enabled"
         private const val KEY_TTS_SPEECH_RATE = "tts_speech_rate"
         private const val KEY_TTS_SYSTEM_ENGINE = "tts_system_engine"
         private const val KEY_PROACTIVE_VOICE = "proactive_voice_enabled"

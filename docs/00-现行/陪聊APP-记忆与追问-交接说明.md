@@ -407,3 +407,44 @@ W/MemoryCtx(15108): 本轮注入记忆块 149 字     ← 用户说「我很开�
 AI 回复：开心什么，背单词背出成就感了？我这边五分钟一次的钟还没响呢，先老实背。
 ⇒ 长期记忆确实被模型用上了（背单词 + 五分钟喝水），但话题被测试数据带偏
 ```
+
+---
+
+## 9. 深度回忆：命中「记不记得/上次」时专门翻记忆（2026-11-22，1.10.0）
+
+**动机**：普通召回是「跟你这句话像不像」。但「你还记不记得那件事」这种问句本身很空，相似度低于 0.45 → 召不回；日记又只看近 3 天，「上次」可能早在两周前。于是命中这类**过去回忆词**时专门放宽翻一遍。
+
+**链路**（全在 App 侧，不碰模型/网络结构）：
+
+1. `domain/memory/RecallTriggerDetector.detect(text)`（纯函数）：命中**明确过去回忆词**（还记得/记不记得/我上次/上次/那次/之前说的…）**且**不含**未来/待办词**（明天/下次/答应/提醒我…）才 `triggered=true`。坑：「你还记不记得我**明天**要开会」是提醒不是回忆，靠排除词挡掉。
+2. `ChatViewModel.generateAssistant`：`deepRecall = detect(...) && getDeepRecallEnabled()`，作为 `recallMode` 传进 `MemoryContextProvider.build`，记忆预算 12%→18%。
+3. `MemoryContextProvider.build(recallMode=true)`：**两档渐进放宽**——
+   - 第一档：日记 3→14 天、短期阈值 0.45→0.32、短期名额 4→6；
+   - 第一档短期+日记一条都没过线 → 第二档：日记扫到 ≤180 天、阈值 0.28；
+   - 长期记忆照旧全量注入（稳定事实，不算「凑数」）。
+4. **翻不到就认、不瞎编**（用户明确要求）：`ContextBuilder.CAPABILITIES` 新增永久规则「记不清就坦白、别编具体日期/地点/经过」；回忆轮再由 `MemoryContextBlock.RECALL_NOTE` 追加一句尾部轻提示。**绝不塞「最近/重要度」无关记忆凑数**——`MemoryContextBlock.build` 在无匹配时只返回该提示，不返回随机记忆。
+5. 开关：设置页「深度回忆」默认开（`ConfigRepository.KEY_DEEP_RECALL`），关掉即回普通召回。
+
+**为什么一期不做「模糊指代」**（那个 / 之前那家）：误伤最多，只做明确词；二期若做，也只应在虚词旁有具体名词时触发。
+
+**降级**：检测是纯字符串、失败最多「少翻一次」；provider 任一步异常 `runCatching → null`，不影响主对话。
+
+---
+
+## 10. 长期记忆去重失效修复（2026-11-22，1.10.1）
+
+**现象**：手动在记忆页加「用户说有一家糖水店的绿豆汤很好喝」，聊完又自动写入「用户喜欢喝糖水店的绿豆汤」，两条并存没合并。
+
+**真机取证**（拉库看 `memory_long`）：手动加的那条 `category=fact` 且 **`embedding` 为空（0 字节）**；自动写的那条 `category=preference` 有向量。所以去重根本没机会比较。
+
+**两个根因**：
+1. **手动加记忆裸插**：`MemoryViewModel.addShort/addLong` 直接 `dao.insert`，不算向量、不走去重 → 向量为空，之后既不能语义去重也不能召回。
+2. **去重只比同类别**：`MemoryDeduplicator.upsertLong` 用 `filter { category == cat }`，`fact` 和 `preference` 同义也永不比较。
+
+**修复**：
+- 手动加记忆改走 `MemoryDeduplicator.upsertShort/upsertLong`（算向量 + 去重）。
+- `upsertLong` 改**跨类别比较**；唯一护栏：**allergy 不与其它类别互相合并**（别把「对花生过敏」并成「不喜欢花生」而丢过敏事实），合并保留原类别。
+- 新增 `consolidatePlainLong()`：进聊天页、embedding 就绪后跑一次，**合并历史重复 + 给旧记录补向量**；幂等、只动 `intensity<=0` 的普通记忆，不碰情绪记忆（那是另一套子系统）。
+
+**注意**：整理只解决"已存在的重复"，将来靠 `upsertLong` 实时去重；阈值仍是 0.85，真机若发现该并没并，用 `MemoryCtx`/`MemoryDedup` 日志核分数再调。
+

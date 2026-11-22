@@ -57,7 +57,7 @@ class ReminderDoneReceiver : BroadcastReceiver() {
         const val EXTRA_NOTIFICATION_ID = "extra_notification_id"
         /** V2.2.5：追问链的 reminder id */
         const val EXTRA_REMINDER_ID = "extra_reminder_id"
-        /** V2.2.5：`"done"` / `"postpone"`；缺失按 done（旧通知兼容） */
+        /** `"done"` / `"postpone"` / `"dismiss"`；缺失按 done（旧通知兼容） */
         const val EXTRA_ACTION = "extra_action"
     }
 }

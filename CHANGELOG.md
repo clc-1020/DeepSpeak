@@ -15,6 +15,59 @@
 
 ---
 
+## [1.10.2] - 2026-11-22 · versionCode 71
+
+**测试基线：1100 / 129 suite / 0 失败**（+1：`MemoryDeduplicatorTest` 长期阈值 0.80 独立于短期 0.85）
+
+### 修复（长期记忆同义句仍差一点没合并）
+- **现象**：1.10.1 后仍残留「用户说有一家糖水店的绿豆汤很好喝」与「用户喜欢一家糖水店的绿豆汤，但店名和具体街道记不清了」两条未合并。
+- **真机取证**：拉库算余弦，两条 **cos=0.8400**——同一件事换个说法，**卡在 0.85 阈值上**（同库无关的「用户有一只猫叫肥波」只有 0.36，离得很远）。
+- **修复**：给长期记忆单独一个更低的合并阈值 `longThreshold=0.80`（短期仍 0.85）；`upsertLong` 与 `consolidatePlainLong` 都改用它。避免把无关事实误并（实测无关项 0.36，余量很大），又能把「换词同义」并掉。
+
+---
+
+## [1.10.1] - 2026-11-22 · versionCode 70
+
+**测试基线：1099 / 129 suite / 0 失败**（+3：`MemoryDeduplicatorTest` 跨类别合并 + 过敏护栏 + 历史整理合并/补向量/无重复幂等）
+
+### 修复（长期记忆同义项不合并 → 越记越多）
+- **根因（两处叠加）**：① 手动加记忆（`MemoryViewModel.addLong/addShort`）直接 `insert`，**不算向量、不去重** → 这些记录 `embedding` 为空，永远无法参与语义去重/召回；② `MemoryDeduplicator.upsertLong` **只在同 category 内比较** → 「用户说X很好喝(fact)」和「用户喜欢喝X(preference)」同义却因类别不同永不合并。真机实测：手动加「用户说有一家糖水店的绿豆汤很好喝」，聊完后又新写「用户喜欢喝糖水店的绿豆汤」，两条并存。
+- **修复**：① 手动加记忆改走 `MemoryDeduplicator.upsertShort/upsertLong`（算向量 + 去重），不再裸插；② `upsertLong` 改为**跨类别比较**，仅保留安全护栏——**allergy（过敏/忌口）不与其它类别互相合并**，合并保留原类别；③ 新增 `consolidatePlainLong()`：进聊天页、embedding 就绪后**一次性整理历史普通长期记忆**（合并重复 + 给旧记录补向量），幂等，只动 `intensity<=0` 的普通记忆，不碰情绪记忆。
+
+---
+
+## [1.10.0] - 2026-11-22 · versionCode 69
+
+**测试基线：1096 / 129 suite / 0 失败**（+6：`RecallTriggerDetectorTest` 触发词/未来排除；+3：`MemoryContextBlockTest` 回忆提示与"翻不到也提示"；+3：`MemoryContextProviderTest` recallMode 放宽阈值/更久日记/不凑数）
+
+### 新增
+- **深度回忆（问旧事时专门翻记忆）**：当用户说「你还记不记得…」「我上次…」「之前说的…」这类**过去回忆**时，App 先把记忆多翻一遍再交给模型，让她答得像真记得；普通闲聊完全不受影响、零额外成本。
+  - **触发判定**（`RecallTriggerDetector`，纯函数）：只认**明确过去回忆词**；命中后若句子带**未来/待办**（明天/下次/答应/提醒我…）**一律不算回忆**，避免把"你还记不记得我明天要开会"当成翻旧账。
+  - **渐进放宽**（`MemoryContextProvider.recallMode`）：日记窗口 3→14 天、短期相似度阈值 0.45→0.32、短期名额 4→6；第一档一条都没捞到再放到"更久日记（≤180 天）+ 阈值 0.28"。仅这些轮次记忆预算 12%→18%。
+  - **翻不到就认、不瞎编**：`ContextBuilder.CAPABILITIES` 新增永久规则「记不清就坦白、别编具体日期/地点/经过」；回忆轮再附一句尾部轻提示。**不塞"最近/重要度"无关记忆凑数。**
+  - 设置页新增开关「深度回忆（问旧事时专门翻记忆）」，默认开；关掉即回普通召回。
+
+---
+
+## [1.9.4.2] - 2026-11-22 · versionCode 68
+
+**测试基线：1084 / 128 suite / 0 失败**（+5：`ProactiveGateRulesTest` 冷却锚点回归；+4：`TimeChangeSignalsTest` 时间变更识别；+5：`NotificationActionsTest`/`ReminderActionHandlerTest`/`ProactiveDeliveryRunnerTest` 三态回执与长期话题）
+
+### 变更
+- **启动器图标改回「白底 + 黑色鲸鱼线稿」**（原为黑底白鲸）：`ic_launcher_background` 改 `#FFFFFF`，重出各密度 `ic_launcher(_round/_foreground).png`。**App 内对话页的鲸鱼图标（`ic_whale` / `ic_whale_light`）保持不变。**
+- **新增「系统时间变更」广播接收器**（`TimeChangeSignals` + `SystemTimeChangeReceiver`，监听 TIME_SET / TIMEZONE_CHANGED）：手动改时间 / 换时区后**即时**重排 WorkManager 周期任务、环境整点闹钟、以及**未来**的提醒闹钟（不重放过期提醒，避免时间前跳触发一堆补发）。修「改时间时进程还活着、只在冷启动才自愈 → 一直不发」的漏网。
+
+### 修复（重大 bug：用户沉默时"随机主动节奏"失效）
+- **主动消息冷却锚点用错**：1.9.4.1 的冷却锚点+随机种子只用了「用户上次说话」(`last_interaction`)，而它**只在你发消息时更新**、她主动发消息后不前进。结果她主动发过一条后锚点不动、`now-锚点` 持续变大 → 之后每 2h 检查全部放行，随机间隔塌成"每 2h 一条直到每日上限"；你沉默期间反而被每 2h 轰炸，而"每句随机 2~4h"实际只对你说过的上一句生效一次。
+- **修复**：冷却锚点改为 `max(用户上次说话, 她上次主动送达)`（`app_state[proactive_last_delivered_at]`，每条真实自发消息送达时写入）。随机种子也用这个锚点。这样她每主动发一条就**重新起算**下一个随机间隔，沉默期也能按 2~4h 随机节奏正常找你，不再塌成固定 2h。
+- **不动** Worker 周期 / 冷却常数 / 数据库 / 发送路径。
+
+### 修复（"关心"消息误挂"已完成"按钮 → 误扣分 / 误删短期记忆）
+- **根因**：1.9.4.0 把"长期记忆兜底关心"的 id 塞进了 `completeMemoryId`（"已完成"槽位），通知于是挂了"已完成"按钮；点击后 `ReminderActionHandler` 先试长期、`dismissById` 对**非情绪类长期记忆**返回 false，就退回 `memoryShortDao().deleteById(longId)`——**短期/长期两表各自从 1 编号会撞车 → 可能删掉一条毫不相关的短期记忆**；即便命中情绪记忆，点"已完成"也会被当"嫌烦"扣分。
+- **修复（B 方案：按角色三态分流，不再靠编号猜类型）**：通知数据拆成两个独立槽位——`completeMemoryId`（仅指令提醒的短期记忆 → "已完成"→删短期）、`dismissLongMemoryId`（仅长期兜底话题 → "别提这个"→只降权/冷却、绝不删行）。`NotificationActions` 新增 `DISMISS` 按钮类型与 `ACTION_DISMISS`，回执按 action 分流：DONE 只删短期、DISMISS 只降权长期、二者绝不互相串；短期话题闲聊(Memory) 依旧无按钮。彻底消除跨表误删。
+
+---
+
 ## [1.9.4.1] - 2026-11-22 · versionCode 67
 
 **测试基线：1070 / 127 suite / 0 失败**（+7：RelationshipStage 间隔 3 + ProactiveGateRules gap 3 + 容量 bug 回归 1）

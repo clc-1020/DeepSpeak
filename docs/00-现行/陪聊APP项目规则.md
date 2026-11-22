@@ -2417,7 +2417,7 @@ emotion_state = {"his":{"mood":"happy","intensity":0.7},
 主动消息频率原本与关系无关（固定 2h 检查 / 1h 冷却 / 每日上限 8）。用户要求"生疏少打扰、亲近更黏"。经讨论定为：**间隔从「上次用户说话」算起、随机**（生疏 3~4h / 熟悉 2~4h / 亲近 2~3h），每日上限保持 8 不变（16h 清醒 ÷ 2h 是刻意设计，用户要睡觉）。
 
 ### 关键决策（写进铁律）
-- **间隔必须从「上次说话」算，不是从「上次她发消息」算**：真人不会在你刚聊完后马上又"主动"找你；`lastInteractionMillis` 现成，直接复用。
+- ~~**间隔必须从「上次说话」算，不是从「上次她发消息」算**：真人不会在你刚聊完后马上又"主动"找你；`lastInteractionMillis` 现成，直接复用。~~ **⚠️ 1.9.4.2 修正：这条是错的。** 只用 `lastInteractionMillis`（仅用户发消息时更新）会导致她主动发过一条后锚点不动、`now-锚点` 持续变大 → 之后每 2h 检查全部放行、随机间隔塌成"每 2h 一条"。锚点必须是 `max(用户说话, 她上次主动送达)`，详见下文 1.9.4.2 节。
 - **随机用「上次说话时刻」当种子**：`Random(seed).nextInt(range)`。同一段"没说"期间等多久固定（不会每 2h 检查一次就重掷导致忽长忽短）；用户再说话 seed 变、重新掷。纯函数、可测、无需持久化随机值。
 - **不碰 Worker 周期/冷却常数**：改周期要 bump `SCHEDULE_SCHEMA`（1.0.5 事故）、冷却要 < 2h 周期（1.0.3 事故），一律不动。只把 `ProactiveGateContext` 的 1h 冷却换成关系档随机 gap（默认仍是 1h，测试零改动）。
 - **2h 检查粒度决定了精度上限**：目标 3~4h 实际会落在"达到后第一个 2h 检查点"，最多晚 2h。这是方案 A（不改周期、零风险）的固有代价，用户已接受。
@@ -2430,6 +2430,30 @@ emotion_state = {"his":{"mood":"happy","intensity":0.7},
 
 ---
 
+## 1.9.4.2（2026-11-22）修复：用户沉默时"随机主动节奏"失效（重大）
+
+### 现象与根因
+用户实测发现"随机关心"节奏不对。根因：1.9.4.1 的冷却锚点/随机种子只用了 `KEY_LAST_INTERACTION`（**仅用户发消息时写**，`ChatViewModel:361`），主动消息送达后**不更新它**。于是她主动发过一条后锚点不动、`now-锚点` 持续变大 → 之后每 2h 检查全部放行，随机间隔退化成"每 2h 一条直到每日上限"；用户沉默期间反而被每 2h 轰炸，且"每句随机 2~4h"实际只对用户说过的上一句生效一次。
+
+### 修复
+- `ProactiveGateContext` 新增 `lastProactiveAtMillis`；冷却锚点统一走 `ProactiveGateRules.cooldownAnchorMillis(ctx)` = `max(用户上次说话, 她上次主动送达)`（两者都空则跳过冷却）。随机种子同样改用这个锚点。
+- `DefaultProactiveGate` 新增 `lastProactiveAtProvider`，生产接 `app_state[KEY_PROACTIVE_LAST_DELIVERED]`（每条真实自发消息送达时由 `onDelivered` 写入，`CompanionApp` 已接线）。
+- 效果：她每主动发一条就**重新起算**下一个随机间隔，沉默期也能按 2~4h 随机节奏找你，不再塌成固定 2h。
+- **不动** Worker 周期 / 冷却常数 / 数据库 / 发送路径。
+
+### 修复（"关心"消息误挂"已完成"→误扣分/误删，B 方案 · 1.9.4.2）
+- 根因：1.9.4.0 把长期兜底话题 id 塞进 `completeMemoryId`；点"已完成"时 `ReminderActionHandler` 先试长期、`dismissById` 对**非情绪类长期记忆**返回 false → 退回 `memoryShortDao().deleteById(longId)`，而短期/长期两表编号各自从 1 起、会撞车 → 误删一条无关短期记忆；命中情绪记忆时点"已完成"也会被当"嫌烦"扣分。
+- 修复（按角色三态，不再靠编号猜类型）：`ProactiveNotification` 拆成 `completeMemoryId`（仅指令提醒的短期 → "已完成"→删短期）与 `dismissLongMemoryId`（仅长期兜底 → "别提这个"→只降权/冷却、不删行）；`NotificationActions` 增 `DISMISS` / `ACTION_DISMISS`；`ReminderActionHandler` 按 action 分流，DONE 只删短期、DISMISS 只降权长期，二者绝不互串；短期话题闲聊(Memory) 依旧无按钮。
+
+### 追加（同版本）：系统时间变更的即时重排（1.9.4.2）
+- 旧自愈（`ensureWorkSchedulesHealthy`）只在 **冷启动** 跑；进程活着时改系统时间救不回来。新增 `TimeChangeSignals`（纯函数识别 `TIME_SET` / `TIMEZONE_CHANGED`，**不含** `DATE_CHANGED`——每天零点会发，误用会天天重置排程）+ `SystemTimeChangeReceiver`（系统广播 → `CompanionApp.healSchedulesAfterTimeChange()`：WorkManager 自愈 + 环境整点闹钟强排 + 仅补排**未来**提醒，不重放过期，避免时间前跳炸出一堆补发）。
+- 仍未覆盖的另一层（留下版）：`syncEnvCheckSchedule` 冷启动只看布尔"已排"标记、时钟回拨也不重排；整点闹钟本身是 RTC，理论上也怕时间跳变——本次靠"收到时间变更就强排"绕开。
+
+### 测试与版本
+- `ProactiveGateRulesTest` +5（锚点取较晚者、她刚发过→拦、超间隔→放行、无用户消息但有主动锚点→拦、双空→放行）；`TimeChangeSignalsTest` +4（时间变更 action 识别）；`NotificationActionsTest` +1 / `ReminderActionHandlerTest` +3 / `ProactiveDeliveryRunnerTest` +1（三态回执分流与长期话题）。全量 **1084 / 128 suite / 0 失败**。`versionCode 68 / versionName 1.9.4.2`。
+
+---
+
 ## 发布签名与打包（1.9.4.1 起，分享用）
 
 - **keystore**：`keystore/companion-release.jks`（别名 `companion`，RSA 2048，有效期 10000 天）。**务必离线备份**——丢了就无法给已安装用户推送新版（签名不一致只能卸载重装、丢数据）。
@@ -2438,3 +2462,24 @@ emotion_state = {"his":{"mood":"happy","intensity":0.7},
 - **R8 keep**：`proguard-rules.pro` 保留 ONNX/Retrofit/Gson + `com.companion.chat.data.**`（覆盖 Room 实体与 Gson DTO）。代码里无 `getIdentifier`/反射动态加载，故无动态资源/反射破坏风险；但**每次大改后仍要用 release 包真机跑一遍**（启动 + 进对话 + 记忆/去重/主动消息），R8 类问题只在运行期暴露。
 - **MIUI 真机安装**：`adb install` 会被 MIUI 拦（`INSTALL_FAILED_USER_RESTRICTED`）。用 root：`adb push apk /data/local/tmp/ && adb shell su -c 'pm install -r -t /data/local/tmp/app-release.apk'`。
 - **换签名会清数据**：debug 签名包 → release 签名包必须卸载（丢数据）。卸载前备份：`adb shell su -c 'tar -cf /sdcard/b.tar -C /data/data/com.companion.chat .' && adb pull /sdcard/b.tar`。分享给别人的用户各自独立安装、各自填 API Key，纯本地无服务器成本。
+
+---
+
+## 1.10.0–1.10.2（2026-11-22）记忆去重阈值：**长 / 短必须不对称**
+
+### 坑（真机踩到，别再改回去）
+长期记忆「同一件事换说法」不去重、越攒越多。拉库算余弦取证：
+- 「用户说有一家糖水店的绿豆汤很好喝」 vs 「用户喜欢一家糖水店的绿豆汤，但店名和具体街道记不清了」→ **cos=0.84**，卡在 0.85 上不合并；
+- 同库无关的「用户有一只猫叫肥波」对上面两条只有 **0.36 / 0.38**（离得很远）。
+
+另有一条更隐蔽：**手动在记忆页加的记忆是裸 `insert`**（不算向量、不去重）→ `embedding` 为空，永远无法参与去重/召回。手动加旧记忆后再聊，就多出一条重复。
+
+### 结论（两条阈值规则，写死别再动）
+- **短期合并阈值必须 ≥ 0.85，不要调低**（`MemoryDeduplicator.threshold`）。短期记忆是**可执行的任务/待办**（「7点吃药」「8点吃药」余弦≈0.9），一降就会把两件不同的事并成一件、**丢提醒/丢任务**，比"重复"危害大得多。短期真有多条，靠 `MemoryContextBlock.dedupeByTopic`（注入时同主题只留一条）+ 容量淘汰（满 50 删 20）兜，不靠降阈值。
+- **长期合并阈值单独用 0.80**（`MemoryDeduplicator.longThreshold`）。长期是稳定事实，重复只是脏；0.80 能并掉 0.84 那类"换词同义"，无关项（实测 0.36）离得远，安全。
+- **安全护栏**：`allergy`（过敏/忌口）不与其它类别互相合并，合并保留原类别（别把"对花生过敏"并成"不喜欢花生"）。
+
+### 配套
+- 手动加记忆（`MemoryViewModel.addShort/addLong`）改走 `MemoryDeduplicator.upsertShort/upsertLong`（算向量 + 去重），不再裸插。
+- `MemoryDeduplicator.consolidatePlainLong()`：进聊天页、embedding 就绪后一次性整理**历史**普通长期记忆（合并重复 + 给旧记录补向量），幂等、只动 `intensity<=0`、不碰情绪记忆。
+- 深挖类改动后仍要**拉库核真实余弦**再定阈值——拍脑袋定 0.85/0.80 都不如实测分数可靠。

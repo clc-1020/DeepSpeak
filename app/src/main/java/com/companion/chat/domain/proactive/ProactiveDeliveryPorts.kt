@@ -12,6 +12,12 @@ data class ProactiveNotification(
     /** 指令提醒关联的短期记忆 id：非空时通知带「已完成」按钮，点后删除该记忆。任务 3.7 */
     val completeMemoryId: Long? = null,
     /**
+     * 1.9.4.2：长期记忆兜底「关心」话题的 id。非空时通知带「别提这个」按钮，
+     * 点后**只给该长期记忆降权/冷却、绝不删除任何短期记忆**——与 [completeMemoryId] 语义彻底分开，
+     * 修「长期 id 塞进完成槽位 → 编号撞车误删短期记忆」的 bug。
+     */
+    val dismissLongMemoryId: Long? = null,
+    /**
      * 追问链的提醒 id（V2.2.5，计划书 §3.9）：非空时通知挂「已完成」「再等等」两个按钮。
      * 非追问消息恒为 null —— 不要给它默认值以外的语义。
      */

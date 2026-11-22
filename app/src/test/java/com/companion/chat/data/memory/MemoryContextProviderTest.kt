@@ -171,4 +171,62 @@ class MemoryContextProviderTest {
         val block = p.build("今天好累", budgetChars = 5000, emotional = listOf("2026-11-21 你夸我，我当时开心。"))!!
         assertTrue("情绪回忆不能被普通记忆挤出", block.contains("你夸我"))
     }
+
+    // ---- 2026-11-22：深度回忆（recallMode）----
+
+    @Test
+    fun recall_mode_lowers_threshold_so_weak_match_surfaces() = runBlocking {
+        val emb = FakeEmbedding(
+            map = mapOf(
+                "你还记得那次吗" to floatArrayOf(1f, 0f, 0f),
+                "半相关的旧事" to floatArrayOf(0.35f, 0.9367f, 0f) // cos≈0.35（>0.32 但 <0.45）
+            )
+        )
+        val p = provider(short = listOf(shortRow(1, "半相关的旧事")), embedding = emb)
+
+        assertNull("普通阈值 0.45 会拦住弱相关", p.build("你还记得那次吗", budgetChars = 2000))
+
+        val recall = p.build("你还记得那次吗", budgetChars = 2000, recallMode = true)!!
+        assertTrue("深度回忆阈值 0.32 放进来", recall.contains("半相关的旧事"))
+    }
+
+    @Test
+    fun recall_mode_reaches_old_daily_beyond_normal_window() = runBlocking {
+        val daily = listOf(
+            MemoryDailyEntity(date = "2026-11-24", events = "今天没事1"),
+            MemoryDailyEntity(date = "2026-11-23", events = "今天没事2"),
+            MemoryDailyEntity(date = "2026-11-22", events = "今天没事3"),
+            MemoryDailyEntity(date = "2026-11-21", events = "今天没事4"),
+            MemoryDailyEntity(date = "2026-09-01", events = "那家糖水店")
+        )
+        val emb = FakeEmbedding(
+            map = mapOf(
+                "你还记得那家店吗" to floatArrayOf(1f, 0f, 0f),
+                "那家糖水店" to floatArrayOf(0.9f, 0.4359f, 0f) // cos≈0.9
+            )
+        )
+        val p = provider(daily = daily, embedding = emb)
+
+        assertNull("普通轮只看近 3 天，翻不到更早的日记", p.build("你还记得那家店吗", budgetChars = 5000))
+
+        val recall = p.build("你还记得那家店吗", budgetChars = 5000, recallMode = true)!!
+        assertTrue("深度回忆把更久的日记翻出来", recall.contains("那家糖水店"))
+    }
+
+    @Test
+    fun recall_mode_with_no_match_returns_only_honesty_note_not_random_memories() = runBlocking {
+        val emb = FakeEmbedding(map = mapOf("你还记得那事吗" to floatArrayOf(1f, 0f, 0f)))
+        val p = provider(short = listOf(shortRow(1, "完全无关的短期")), embedding = emb)
+
+        // 普通轮：没相关 → null
+        assertNull(p.build("你还记得那事吗", budgetChars = 2000))
+
+        // 深度回忆轮：翻不到 → 只给"记不清别编"的提示，绝不塞无关记忆凑数（坑2）
+        val out = p.build("你还记得那事吗", budgetChars = 2000, recallMode = true)!!
+        assertEquals(
+            com.companion.chat.domain.memory.MemoryContextBlock.RECALL_NOTE.trim(),
+            out.trim()
+        )
+        assertTrue("不许拿无关记忆凑数", !out.contains("完全无关的短期"))
+    }
 }

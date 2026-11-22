@@ -18,7 +18,8 @@ import kotlinx.coroutines.launch
  */
 class MemoryViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val db = (app as CompanionApp).database
+    private val appRef = app as CompanionApp
+    private val db = appRef.database
     private val shortDao = db.memoryShortDao()
     private val longDao = db.memoryLongDao()
     private val dailyDao = db.memoryDailyDao()
@@ -33,9 +34,10 @@ class MemoryViewModel(app: Application) : AndroidViewModel(app) {
         dailyDao.observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     // ---- 短期 ----
+    // 2026-11-22：手动添加也走语义去重（算向量 + 近似合并），不再裸插——否则手动项无向量、无法召回/去重。
     fun addShort(content: String) = viewModelScope.launch {
         if (content.isNotBlank()) {
-            shortDao.insert(MemoryShortEntity(content = content.trim(), timestamp = System.currentTimeMillis()))
+            appRef.memoryDeduplicator.upsertShort(content.trim())
         }
     }
 
@@ -44,15 +46,10 @@ class MemoryViewModel(app: Application) : AndroidViewModel(app) {
     fun deleteShort(item: MemoryShortEntity) = viewModelScope.launch { shortDao.delete(item) }
 
     // ---- 长期 ----
+    // 2026-11-22：手动添加走语义去重（跨类别比较 + 算向量），修「手动加了 fact，之后 preference 同义却不合并」。
     fun addLong(content: String, category: String) = viewModelScope.launch {
         if (content.isNotBlank()) {
-            longDao.insert(
-                MemoryLongEntity(
-                    content = content.trim(),
-                    category = category.ifBlank { "fact" },
-                    createTime = System.currentTimeMillis()
-                )
-            )
+            appRef.memoryDeduplicator.upsertLong(content.trim(), category.ifBlank { "fact" })
         }
     }
 

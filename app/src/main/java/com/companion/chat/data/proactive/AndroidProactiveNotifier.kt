@@ -48,7 +48,8 @@ class AndroidProactiveNotifier(private val context: Context) : ProactiveNotifier
         NotificationActions.planFor(
             notificationId = notification.notificationId,
             completeMemoryId = notification.completeMemoryId,
-            followupReminderId = notification.followupReminderId
+            followupReminderId = notification.followupReminderId,
+            dismissLongMemoryId = notification.dismissLongMemoryId
         ).forEach { action ->
             val actionIntent = Intent(context, ReminderDoneReceiver::class.java).apply {
                 // 同时设 action 字符串：Intent 的 filterEquals 不看 extras，
@@ -62,7 +63,13 @@ class AndroidProactiveNotifier(private val context: Context) : ProactiveNotifier
                 setAction(ACTION_PREFIX + action.kind.name.lowercase() + ":" + notification.notificationId)
                 putExtra(ReminderDoneReceiver.EXTRA_ACTION, wireActionOf(action.kind))
                 putExtra(ReminderDoneReceiver.EXTRA_NOTIFICATION_ID, notification.notificationId)
-                notification.completeMemoryId?.let {
+                // 1.9.4.2：按按钮种类带对应 id——DONE 带短期(指令)id、DISMISS 带长期(别提)id、POSTPONE 不带
+                val memoryIdForAction = when (action.kind) {
+                    NotificationActionKind.DONE -> notification.completeMemoryId
+                    NotificationActionKind.DISMISS -> notification.dismissLongMemoryId
+                    NotificationActionKind.POSTPONE -> null
+                }
+                memoryIdForAction?.let {
                     putExtra(ReminderDoneReceiver.EXTRA_MEMORY_ID, it)
                 }
                 notification.followupReminderId?.let {
@@ -88,16 +95,19 @@ class AndroidProactiveNotifier(private val context: Context) : ProactiveNotifier
     private fun labelOf(kind: NotificationActionKind): String = when (kind) {
         NotificationActionKind.DONE -> "已完成"
         NotificationActionKind.POSTPONE -> "再等等"
+        NotificationActionKind.DISMISS -> "别提这个"
     }
 
     private fun iconOf(kind: NotificationActionKind): Int = when (kind) {
         NotificationActionKind.DONE -> R.drawable.ic_check
         NotificationActionKind.POSTPONE -> R.drawable.ic_pause
+        NotificationActionKind.DISMISS -> R.drawable.ic_not_interested
     }
 
     private fun wireActionOf(kind: NotificationActionKind): String = when (kind) {
         NotificationActionKind.DONE -> NotificationActions.ACTION_DONE
         NotificationActionKind.POSTPONE -> NotificationActions.ACTION_POSTPONE
+        NotificationActionKind.DISMISS -> NotificationActions.ACTION_DISMISS
     }
 
     private fun ensureChannel() {

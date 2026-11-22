@@ -75,12 +75,14 @@ class MemoryDeduplicatorTest {
     private val A = "我明天要面试"
     private val A2 = "明天去公司面试"
     private val B = "我喜欢猫"
+    private val C082 = "用户说糖水店的绿豆汤不错" // 与 A 余弦≈0.82
 
     private val emb = FakeEmb(
         mapOf(
             A to floatArrayOf(1f, 0f, 0f),
             A2 to floatArrayOf(0.98f, 0.12f, 0f), // 与 A 余弦 ≈0.99 > 0.85
-            B to floatArrayOf(0f, 1f, 0f)         // 与 A 正交 ≈0
+            B to floatArrayOf(0f, 1f, 0f),         // 与 A 正交 ≈0
+            C082 to floatArrayOf(0.82f, 0.5724f, 0f) // 与 A 余弦 ≈0.82（<0.85 但 >0.80）
         )
     )
 
@@ -139,11 +141,69 @@ class MemoryDeduplicatorTest {
     }
 
     @Test
-    fun long_different_category_not_merged() = runBlocking {
+    fun long_cross_category_merges_when_same_meaning() = runBlocking {
+        // 2026-11-22：fact vs preference 同义也要合并（以前按同类别比较 → 漏合并，真机 bug）
         val s = FakeShort(); val l = FakeLong()
         val d = dedup(s, l)
-        assertEquals(1, d.upsertLong(A, "plan"))
-        assertEquals(1, d.upsertLong(A2, "health")) // 不同类别，不比较
+        assertEquals(1, d.upsertLong(A, "fact"))
+        assertEquals(0, d.upsertLong(A2, "preference"))
+        assertEquals(1, l.items.size)
+        assertEquals("fact", l.items[0].category) // 保留先来那条的类别
+    }
+
+    @Test
+    fun long_allergy_never_merged_with_non_allergy() = runBlocking {
+        // 安全护栏：过敏 vs 非过敏即便同义也不合并（别把"过敏"并成"不喜欢"）
+        val s = FakeShort(); val l = FakeLong()
+        val d = dedup(s, l)
+        assertEquals(1, d.upsertLong(A, "allergy"))
+        assertEquals(1, d.upsertLong(A2, "preference"))
+        assertEquals(2, l.items.size)
+    }
+
+    @Test
+    fun long_merges_at_lower_threshold_than_short() = runBlocking {
+        // 余弦 0.82：短记忆阈值 0.85 不合并；长期阈值 0.80 合并（修真机 0.84 同义不并）
+        val s = FakeShort(); val l = FakeLong()
+        val d = dedup(s, l)
+        assertEquals(1, d.upsertShort(A))
+        assertEquals(1, d.upsertShort(C082))
+        assertEquals(2, s.items.size)
+
+        assertEquals(1, d.upsertLong(A, "fact"))
+        assertEquals(0, d.upsertLong(C082, "preference"))
+        assertEquals(1, l.items.size)
+    }
+
+    @Test
+    fun consolidate_merges_existing_cross_category_duplicates_and_backfills() = runBlocking {
+        val s = FakeShort(); val l = FakeLong()
+        // 模拟真机脏数据：一条无向量的 fact + 一条有向量的 preference，内容近似（A2 更长）
+        l.items.add(MemoryLongEntity(id = 1, content = A, category = "fact", createTime = 1))
+        l.items.add(
+            MemoryLongEntity(
+                id = 2, content = A2, category = "preference", createTime = 2,
+                embedding = com.companion.chat.data.embedding.FloatArrayCodec
+                    .toBytes(floatArrayOf(0.98f, 0.12f, 0f))
+            )
+        )
+        val d = dedup(s, l)
+        val merged = d.consolidatePlainLong()
+        assertEquals(1, merged)
+        assertEquals(1, l.items.size)
+        // 保留内容更长的那条（A2 比 A 长）
+        assertEquals(A2, l.items[0].content)
+        // 保留下来的那条必须带向量（旧的无向量记录在整理时被补算）
+        assertTrue(l.items[0].embedding != null && l.items[0].embedding!!.isNotEmpty())
+    }
+
+    @Test
+    fun consolidate_is_noop_when_no_duplicates() = runBlocking {
+        val s = FakeShort(); val l = FakeLong()
+        l.items.add(MemoryLongEntity(id = 1, content = A, category = "fact", createTime = 1))
+        l.items.add(MemoryLongEntity(id = 2, content = B, category = "fact", createTime = 2))
+        val d = dedup(s, l)
+        assertEquals(0, d.consolidatePlainLong())
         assertEquals(2, l.items.size)
     }
 

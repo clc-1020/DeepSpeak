@@ -101,7 +101,17 @@ data class ProactiveGateContext(
      * 1.9.4.1：本轮最低间隔（毫秒），默认 = [ProactiveGateRules.COOLDOWN_MILLIS]（向后兼容）。
      * 生产由关系档随机算出（生疏 3~4h / 熟悉 2~4h / 亲近 2~3h），从「上次交互」起算。
      */
-    val proactiveGapMillis: Long = ProactiveGateRules.COOLDOWN_MILLIS
+    val proactiveGapMillis: Long = ProactiveGateRules.COOLDOWN_MILLIS,
+
+    /**
+     * 1.9.4.2：上一条主动消息**送达**时刻（epoch millis，null=从未主动发过）。
+     *
+     * 冷却锚点 = max([lastInteractionMillis], [lastProactiveAtMillis])。1.9.4.1 只用
+     * [lastInteractionMillis]（仅用户发消息时更新），她主动发过一条后锚点不动、`now-锚点`
+     * 持续变大 → 之后每 2h 检查全部放行，随机间隔退化成"每 2h 一条"。纳入主动送达时刻后，
+     * 每条主动消息发出即重新起算，随机间隔才真正生效。
+     */
+    val lastProactiveAtMillis: Long? = null
 )
 
 /**
@@ -132,7 +142,7 @@ object ProactiveGateRules {
      * 兜底冷却窗口：拿不到关系档 / 从未交互时，"距上次交互不足 1 小时"就拦。
      *
      * **注意（1.9.4.1）**：真正生效的间隔是 [ProactiveGateContext.proactiveGapMillis]（关系档随机 3~4h/2~4h/2~3h）。
-     * 关系档随机间隔**可以大于** 2h 检查周期——因为它是从"上次说话"起算，只要用户不再开口就一定会等到、不会吞轮。
+     * 关系档随机间隔**可以大于** 2h 检查周期——因为它是从"上次互动"（用户说话或她上次主动送达，取较晚者）起算，只要用户不再开口也一定会等到、不会吞轮。
      * 这里保留 1h 仅作无关系数据时的安全默认；**改 [com.companion.chat.worker.ProactiveCheckWorker.PERIOD_HOURS] 仍必须 bump SCHEDULE_SCHEMA**。
      */
     const val COOLDOWN_MILLIS: Long = 3_600_000L
@@ -168,9 +178,9 @@ object ProactiveGateRules {
                 ProactiveDecision.allow()
             }
         }
-        // 3. 冷却（1.9.4.1：间隔按关系档，从「上次交互」算起；默认仍是 1h）
-        val last = ctx.lastInteractionMillis
-        if (last != null && ctx.nowMillis - last < ctx.proactiveGapMillis) {
+        // 3. 冷却（1.9.4.1：间隔按关系档；1.9.4.2：锚点=用户说话与她主动送达中较晚者）
+        val anchor = cooldownAnchorMillis(ctx)
+        if (anchor != null && ctx.nowMillis - anchor < ctx.proactiveGapMillis) {
             return ProactiveDecision.block(ProactiveBlockReason.COOLDOWN)
         }
         // 4. 每日上限
@@ -187,6 +197,20 @@ object ProactiveGateRules {
             return ProactiveDecision.block(ProactiveBlockReason.NO_HOOK)
         }
         return ProactiveDecision.allow()
+    }
+
+    /**
+     * 冷却锚点：取「用户上次说话」与「上一条主动消息送达」里较晚的一个。
+     * 两者都为 null（全新用户/从未主动发过）→ null（跳过冷却）。
+     */
+    fun cooldownAnchorMillis(ctx: ProactiveGateContext): Long? {
+        val user = ctx.lastInteractionMillis
+        val proactive = ctx.lastProactiveAtMillis
+        return when {
+            user == null -> proactive
+            proactive == null -> user
+            else -> maxOf(user, proactive)
+        }
     }
 
     /** 当前时刻是否落在勿扰区间（支持跨午夜，如 23:00–07:00）。end 视为开区间（到点即恢复）。 */

@@ -30,6 +30,7 @@ import com.companion.chat.data.memory.MemoryDecayService
 import com.companion.chat.data.memory.MemoryCapacityEnforcer
 import com.companion.chat.data.memory.MemoryContextProvider
 import com.companion.chat.data.memory.MemoryExtractor
+import com.companion.chat.data.memory.MemoryDeduplicator
 import com.companion.chat.data.memory.MemoryFeedbackService
 import com.companion.chat.data.memory.MemoryRecallService
 import com.companion.chat.data.memory.MemoryTopicSelector
@@ -210,6 +211,18 @@ class CompanionApp : Application() {
             memoryLongDao = database.memoryLongDao(),
             memoryDailyDao = database.memoryDailyDao(),
             embeddingServiceProvider = { EmbeddingServiceFactory.ensure(this@CompanionApp) }
+        )
+    }
+
+    /**
+     * 语义去重器（2026-11-22）：手动加记忆（MemoryViewModel）、启动整理历史重复都用它。
+     * 与 [memoryExtractor] 内部的去重器逻辑一致；这里再暴露一个共享实例给 UI 线调用。
+     */
+    val memoryDeduplicator: MemoryDeduplicator by lazy {
+        MemoryDeduplicator(
+            shortDao = database.memoryShortDao(),
+            longDao = database.memoryLongDao(),
+            embeddingProvider = { EmbeddingServiceFactory.ensure(this@CompanionApp) }
         )
     }
 
@@ -441,6 +454,11 @@ class CompanionApp : Application() {
             },
             lastInteractionProvider = {
                 database.appStateDao().get(AppStateEntity.KEY_LAST_INTERACTION)?.toLongOrNull()
+            },
+            // 1.9.4.2：上一条主动消息送达时刻——与用户说话时刻一起构成冷却锚点（取较晚者），
+            // 修「她主动发过一条后锚点不动 → 随机间隔退化成每 2h 一条」的 bug。
+            lastProactiveAtProvider = {
+                database.appStateDao().get(AppStateEntity.KEY_PROACTIVE_LAST_DELIVERED)?.toLongOrNull()
             },
             spontaneousSentTodayProvider = { proactiveSendCounter.countToday() },
             /**
@@ -984,6 +1002,34 @@ class CompanionApp : Application() {
         }.onFailure {
             android.util.Log.w("ProactiveCheck", "排程自愈检查失败（沿用当前排程）：${it.message}")
         }
+    }
+
+    /**
+     * 系统时间被改动 / 时区变更后的即时重排（1.9.4.2）。
+     *
+     * 由 [com.companion.chat.worker.SystemTimeChangeReceiver] 收到 TIME_SET / TIMEZONE_CHANGED 时调用。
+     * 为什么需要：WorkManager 与 AlarmManager 都按「墙上时间」记 next/trigger，时间跳变会把它们
+     * 双双算到遥远的未来；而旧的自愈只在冷启动跑，进程活着时改时间就救不回来。
+     *
+     * 三件事（都 runCatching，失败不回抛）：
+     *  1. [ensureWorkSchedulesHealthy]：时钟回拨/久未排 → 取消并重建 WorkManager 周期任务；
+     *  2. 环境整点闹钟**强制**重排（删标记 + cancel + 按新时钟重算下一次整点）；
+     *  3. [restorePendingRemindersLight]：把**未来**的提醒按新时钟重排。
+     *     **刻意不用 [restoreAlarmsAfterBoot]**——它会把「关机期间错过」的提醒改成立即补发，
+     *     时间往前跳一年会让一堆旧提醒瞬间全炸出来；这里只补未来行。
+     */
+    suspend fun healSchedulesAfterTimeChange() {
+        runCatching { ensureWorkSchedulesHealthy() }
+            .onFailure { android.util.Log.w("TimeChange", "WorkManager 自愈失败: ${it.message}") }
+        runCatching {
+            database.appStateDao().delete(KEY_ENV_CHECK_SCHEDULED)
+            alarmScheduler.cancel(AlarmCodes.ENV_CHECK)
+        }.onFailure { android.util.Log.w("TimeChange", "清理环境整点标记失败: ${it.message}") }
+        runCatching { syncEnvCheckSchedule() }
+            .onFailure { android.util.Log.w("TimeChange", "重排环境整点失败: ${it.message}") }
+        runCatching { restorePendingRemindersLight() }
+            .onFailure { android.util.Log.w("TimeChange", "重排提醒闹钟失败: ${it.message}") }
+        android.util.Log.w("TimeChange", "系统时间变更后的排程重排完成")
     }
 
     /** 调度每日淡忘衰减：周期 24h（KEEP）+ 启动补跑一次（幂等）。 */

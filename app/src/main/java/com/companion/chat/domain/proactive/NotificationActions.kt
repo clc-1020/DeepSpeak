@@ -1,7 +1,7 @@
 package com.companion.chat.domain.proactive
 
 /**
- * 通知按钮的「计划」（V2.2.5）。
+ * 通知按钮的「计划」（V2.2.5；1.9.4.2 增 DISMISS 三态）。
  *
  * 为什么要单独一层：计划书要求单测「followupReminderId == null 时不加追问按钮」，
  * 而 AndroidProactiveNotifier 需要 Context + NotificationCompat.Builder，JVM 单测跑不起来
@@ -13,7 +13,13 @@ enum class NotificationActionKind {
     DONE,
 
     /** 「再等等」：只对追问链有效，等价于点完后重排下一次（不扣次数）。 */
-    POSTPONE
+    POSTPONE,
+
+    /**
+     * 1.9.4.2：「别提这个」——只对「长期记忆兜底关心」通知有效。
+     * 点了只给该长期记忆降权 / 冷却，**绝不删除任何记忆**（尤其不碰短期表，避免编号撞车误删）。
+     */
+    DISMISS
 }
 
 /** 一个要挂到通知上的按钮。[requestCode] 供 PendingIntent 用，同一通知内必须互不相同。 */
@@ -28,23 +34,31 @@ object NotificationActions {
     const val ACTION_DONE = "done"
     const val ACTION_POSTPONE = "postpone"
 
-    // ── requestCode 偏移。三个必须互不相同，见 4.2 的「PendingIntent 覆写」说明 ──
+    /** 1.9.4.2：「别提这个」——只降权长期记忆，不删任何行。 */
+    const val ACTION_DISMISS = "dismiss"
+
+    // ── requestCode 偏移。同一通知内的按钮必须互不相同，见 4.2 的「PendingIntent 覆写」说明 ──
     private const val MEMORY_DONE_OFFSET = 100_000   // 沿用任务 3.7 的既有偏移
     private const val FOLLOWUP_DONE_OFFSET = 300_000
     private const val POSTPONE_OFFSET = 400_000
+    private const val DISMISS_OFFSET = 500_000
 
     /**
      * 决定这条通知挂哪些按钮。
      *
-     * 一条通知的 content 只可能是单一类型（[PendingMessageContent] 是 sealed），
-     * 因此两个 id **正常情况互斥**。但纯函数必须有确定行为，故定：
-     * **两者都非空时按追问处理**（追问的「完成」语义更强：要停整条链）。
-     * 这个兜底由 `both_ids_prefer_followup` 单测钉住。
+     * 一条通知的 content 只可能是单一类型（[PendingMessageContent] 是 sealed），因此下面几个 id
+     * 正常情况互斥。但纯函数必须有确定行为，故优先级定为：**追问 > 已完成(短期) > 别提(长期)**。
+     *
+     * 参数按「角色」分（1.9.4.2 起不再靠记忆编号猜类型）：
+     *  - [completeMemoryId]    指令提醒的短期记忆 → 「已完成」→ 删该短期记忆；
+     *  - [followupReminderId]  追问链 → 「已完成」「再等等」；
+     *  - [dismissLongMemoryId] 长期兜底话题 → 「别提这个」→ 只降权（与完成槽位彻底分开）。
      */
     fun planFor(
         notificationId: Int,
         completeMemoryId: Long?,
-        followupReminderId: Long?
+        followupReminderId: Long?,
+        dismissLongMemoryId: Long? = null
     ): List<PlannedAction> {
         if (followupReminderId != null) {
             return listOf(
@@ -54,6 +68,9 @@ object NotificationActions {
         }
         if (completeMemoryId != null) {
             return listOf(PlannedAction(NotificationActionKind.DONE, code(notificationId, MEMORY_DONE_OFFSET)))
+        }
+        if (dismissLongMemoryId != null) {
+            return listOf(PlannedAction(NotificationActionKind.DISMISS, code(notificationId, DISMISS_OFFSET)))
         }
         return emptyList()
     }

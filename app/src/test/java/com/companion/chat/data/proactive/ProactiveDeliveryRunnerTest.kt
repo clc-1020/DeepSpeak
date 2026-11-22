@@ -397,5 +397,26 @@ class ProactiveDeliveryRunnerTest {
         assertEquals(77L, notifier.shown.single().completeMemoryId)
         assertNull(notifier.shown.single().followupReminderId)
     }
+
+    /** 1.9.4.2：长期兜底话题 → 带「别提这个」的 id，且**不带**「已完成/删短期」语义。 */
+    @Test
+    fun long_memory_content_carries_dismiss_id_not_complete_id() = runBlocking {
+        val dao = FakeDao(); val q = queue(dao)
+        q.enqueue(
+            PendingMessageType.CHITCHAT,
+            PendingMessageContent.LongMemory(88L),
+            t0
+        )
+        val notifier = FakeNotifier()
+        val runner = ProactiveDeliveryRunner(
+            queue = q, gate = FakeGate(true), generator = FakeGen("还记得上次说的那件事吗"),
+            writer = FakeWriter(1L), notifier = notifier, speaker = FakeSpeaker(),
+            now = { t0 }, log = {}
+        )
+
+        assertEquals(ProactiveDeliveryOutcome.DELIVERED, runner.deliverNext())
+        assertEquals(88L, notifier.shown.single().dismissLongMemoryId)
+        assertNull("长期兜底话题不带『已完成/删短期』语义", notifier.shown.single().completeMemoryId)
+    }
 }
 

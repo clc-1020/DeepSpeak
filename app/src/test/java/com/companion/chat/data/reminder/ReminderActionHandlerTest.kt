@@ -48,10 +48,12 @@ class ReminderActionHandlerTest {
         val queue = PendingMessageQueue(dao, now = { T0 })
         val port = FakeFollowupPort(order)
         val deleted = mutableListOf<Long>()
+        val dismissed = mutableListOf<Long>()
         val handler = ReminderActionHandler(
             followupPort = port,
             queue = queue,
-            deleteMemory = { deleted += it }
+            deleteMemory = { deleted += it },
+            dismissLongMemory = { dismissed += it; true }
         )
     }
 
@@ -173,5 +175,32 @@ class ReminderActionHandlerTest {
         assertTrue("complete 必须真的被调用", completeAt >= 0)
         assertTrue("队列清理必须真的被调用", cancelAt >= 0)
         assertTrue("complete($completeAt) 必须先于 cancel($cancelAt)", completeAt < cancelAt)
+    }
+
+    // ---- 1.9.4.2：三态按角色分流，短期/长期两表编号撞了也不串账 ----
+
+    @Test
+    fun done_only_deletes_short_memory_and_never_dismisses_long() = runBlocking {
+        val h = Harness()
+        assertTrue(h.handler.handle(NotificationActions.ACTION_DONE, memoryId = 77L, reminderId = 0L))
+        assertEquals(listOf(77L), h.deleted)
+        assertTrue("『已完成』绝不能碰长期记忆", h.dismissed.isEmpty())
+    }
+
+    @Test
+    fun dismiss_only_dismisses_long_memory_and_never_deletes_short() = runBlocking {
+        val h = Harness()
+        assertTrue(h.handler.handle(NotificationActions.ACTION_DISMISS, memoryId = 88L, reminderId = 0L))
+        assertEquals(listOf(88L), h.dismissed)
+        assertTrue("『别提这个』绝不能删短期记忆", h.deleted.isEmpty())
+        assertTrue("『别提这个』不动追问链", h.port.called.isEmpty())
+    }
+
+    @Test
+    fun dismiss_without_id_is_ignored() = runBlocking {
+        val h = Harness()
+        assertFalse(h.handler.handle(NotificationActions.ACTION_DISMISS, memoryId = 0L, reminderId = 0L))
+        assertTrue(h.deleted.isEmpty())
+        assertTrue(h.dismissed.isEmpty())
     }
 }

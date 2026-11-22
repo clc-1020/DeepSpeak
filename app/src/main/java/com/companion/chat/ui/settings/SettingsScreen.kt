@@ -81,6 +81,8 @@ data class SettingsForm(
     val latestReminderEnabled: Boolean = true,
     val autoTitleEnabled: Boolean = true,
     val jsonModeDefault: Boolean = false,
+    // 2026-11-22：深度回忆（命中「记不记得/上次」等过去回忆词时专门多翻一遍记忆），默认开
+    val deepRecallEnabled: Boolean = true,
     // ---- 任务 V2.1.6：环境感知（默认值与 EnvironmentSettings 一致） ----
     val environmentEnabled: Boolean = EnvironmentSettings.DEFAULT_ENVIRONMENT_ENABLED,
     val lateNightEnabled: Boolean = EnvironmentSettings.DEFAULT_LATE_NIGHT_ENABLED,
@@ -314,6 +316,15 @@ fun SettingsScreen(
             SwitchRow("每轮注入时间/地点元数据（latest_reminder）", form.latestReminderEnabled) {
                 form = form.copy(latestReminderEnabled = it)
             }
+            // 2026-11-22：深度回忆开关（默认开）。命中回忆词才多翻记忆，平时零额外成本。
+            SwitchRow("深度回忆（问旧事时专门翻记忆）", form.deepRecallEnabled) {
+                form = form.copy(deepRecallEnabled = it)
+            }
+            Text(
+                "开启后，当你说「你还记不记得…」「我上次…」这类过去的事时，会专门去日记/长期/短期记忆里多翻一遍（含更久以前）。翻不到会如实说记不清，不会瞎编。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             SwitchRow("官方语音（联网计费）", form.deepSeekTtsEnabled) {
                 form = form.copy(deepSeekTtsEnabled = it)
             }

@@ -140,6 +140,7 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
                     latestReminderEnabled = c.latestReminderEnabled,
                     autoTitleEnabled = c.autoTitleEnabled,
                     jsonModeDefault = c.jsonModeDefault,
+                    deepRecallEnabled = app.configRepository.getDeepRecallEnabled(),
                     environmentEnabled = env.environmentEnabled,
                     lateNightEnabled = env.lateNightEnabled,
                     lateNightHour = env.lateNightHour,
@@ -210,6 +211,8 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
                 // V2.3.6：保存后当场同步常驻入口，关掉即撤通知，不等下次进前台
                 app.configRepository.setQuickAccessEnabled(form.quickAccessEnabled)
                 QuickAccessEntrance.sync(context)
+                // 2026-11-22：深度回忆开关（命中回忆词才多翻记忆）
+                app.configRepository.setDeepRecallEnabled(form.deepRecallEnabled)
                 app.configRepository.setProactiveVoiceEnabled(form.proactiveVoiceEnabled)
                 app.configRepository.setDndEnabled(form.dndEnabled)
                 // 任务 7.1/7.2：主动消息总开关、每日上限、勿扰区间与「区间内不发通知」

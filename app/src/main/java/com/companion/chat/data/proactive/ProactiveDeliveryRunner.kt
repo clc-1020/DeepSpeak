@@ -169,10 +169,12 @@ class ProactiveDeliveryRunner(
                 title = title,
                 body = text,
                 conversationId = convId,
-                // 1.9.4.0：长期记忆兜底也挂"别提"按钮（回执走 EmotionalMemoryService.dismissById）；
-                // 短期 Instruction 的既有按钮口径不变。
-                completeMemoryId = PendingMessageContent.completeMemoryIdOrNull(msg.content)
-                    ?: PendingMessageContent.longMemoryIdOrNull(msg.content),
+                // 1.9.4.2：按「角色」分流的两个独立槽位——
+                //  - 指令提醒(Instruction)：短期记忆 id → 「已完成」→ 删短期（completeMemoryId）
+                //  - 长期兜底话题(LongMemory)：长期记忆 id → 「别提这个」→ 只降权（dismissLongMemoryId）
+                // 短期话题闲聊(Memory) 两个都不带 → 无按钮。不再把 longId 塞进「完成」槽位（旧 bug）。
+                completeMemoryId = PendingMessageContent.completeMemoryIdOrNull(msg.content),
+                dismissLongMemoryId = PendingMessageContent.longMemoryIdOrNull(msg.content),
                 // V2.2.5：追问消息把 reminderId 带到通知上供按钮回执使用。
                 // 用现成的 followupOrNull（= decode(...) as? Followup），非追问恒 null。
                 followupReminderId = PendingMessageContent.followupOrNull(msg.content)?.reminderId

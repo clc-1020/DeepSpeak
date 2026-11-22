@@ -109,6 +109,19 @@
             </intent-filter>
         </receiver>
 
+        <!-- 系统时间被改动 / 时区变更后即时重排（1.9.4.2）。
+             时间跳变会把 WorkManager/AlarmManager 的 next 推到遥远的未来；收广播后立即重建，
+             覆盖「改时间时进程还活着、没触发冷启动自愈」的漏网。TIME_SET/TIMEZONE 均为系统受保护广播，
+             exported="true" 是标准写法（设 false 收不到）。刻意不含 DATE_CHANGED（每天零点会发，会天天重置）。 -->
+        <receiver
+            android:name=".worker.SystemTimeChangeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+            </intent-filter>
+        </receiver>
+
         <!-- 通知栏常驻快捷入口（V2.3.6）：只在 MainActivity.onResume 由前台界面拉起，
              绝不在 CompanionApp 里启动（冷启动拉 FGS 在 Android 12+ 会抛 ForegroundServiceStartNotAllowedException） -->
         <service
