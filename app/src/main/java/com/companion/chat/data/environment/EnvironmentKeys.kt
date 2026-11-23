@@ -22,6 +22,20 @@ object EnvironmentKeys {
     /** 上次「前台刷新定位」的 `epochDay`。每天首次打开才刷新一次。 */
     const val LOCATION_REFRESHED_DATE = "location_refreshed_date"
 
+    // ---------- 2026-11-22：自动定位反查到的城市名（给 latest_reminder 第 3 段用） ----------
+
+    /**
+     * 自动定位反查到的城市名。**只在每天首次刷新定位成功时写入**，
+     * 发送路径只读它；没有（从没成功反查过）→ 注记第 3 段保持空。
+     */
+    const val AUTO_CITY_NAME = "auto_city_name"
+
+    /** 上述城市名对应的纬度（十进制字符串）。用来判断名字是不是已经过期（人换城市了）。 */
+    const val AUTO_CITY_LAT = "auto_city_lat"
+
+    /** 上述城市名对应的经度。 */
+    const val AUTO_CITY_LON = "auto_city_lon"
+
     // ---------- SharedPreferences（天气缓存，可丢弃） ----------
 
     /** 上一次成功的预报原始 JSON（不裁剪字段，便于以后加规则不用重新拉）。 */

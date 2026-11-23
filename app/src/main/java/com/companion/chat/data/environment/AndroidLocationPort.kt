@@ -5,12 +5,21 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.location.LocationManager
 import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
+import androidx.core.os.CancellationSignal
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
 
 /**
  * [LocationPort] 的 Android 实现。任务 V2.1.1。
  *
- * **只读历史位置**（`getLastKnownLocation`），不注册 `requestLocationUpdates`：
- * 天气只要城市级精度，被动读一次就够，主动定位会让「每小时判一次」的常驻逻辑变成耗电大户。
+ * **两种取法，别混用**：
+ * - [lastKnown]：被动读系统缓存（`getLastKnownLocation`），**不注册 `requestLocationUpdates`**。
+ *   后台（整点检查、送达 Worker）只能走这条——后台请求定位在 Android 10+ 要「始终允许」权限，
+ *   本 App 不申请。
+ * - [currentOnce]：主动要一次（2026-11-22）。**只允许在前台调**（每天首次回前台刷新位置），
+ *   那时只需要「仅使用 App 时允许」，不引入后台权限。
  *
  * 三类失败一律返回 null，**绝不抛**：
  * 1. 没有 `ACCESS_COARSE_LOCATION` / `ACCESS_FINE_LOCATION` → `SecurityException`
@@ -39,6 +48,49 @@ class AndroidLocationPort(private val context: Context) : LocationPort {
             null
         }
         return location?.let { GeoPoint(it.latitude, it.longitude) }
+    }
+
+    /**
+     * 主动请求一次位置，最多等 [timeoutMs]。
+     *
+     * 用 [LocationManagerCompat.getCurrentLocation]：API 30+ 走系统的当前定位接口，
+     * 低版本由 androidx 内部降级成 `requestSingleUpdate`，minSdk 26 也能用。
+     *
+     * 超时用 [withTimeoutOrNull] 兜底（用户要求「加兜底」）：拿不到就返回 null，
+     * 绝不让前台等下去。超时同时会取消系统侧的请求，不会留下监听。
+     */
+    override suspend fun currentOnce(provider: String, timeoutMs: Long): GeoPoint? {
+        if (!hasLocationPermission()) return null
+        val lm = manager ?: return null
+        val enabled = try {
+            lm.isProviderEnabled(provider)
+        } catch (e: IllegalArgumentException) {
+            false
+        }
+        if (!enabled) return null
+
+        return withTimeoutOrNull(timeoutMs) {
+            suspendCancellableCoroutine { cont ->
+                val signal = CancellationSignal()
+                cont.invokeOnCancellation { signal.cancel() }
+                try {
+                    LocationManagerCompat.getCurrentLocation(
+                        lm,
+                        provider,
+                        signal,
+                        ContextCompat.getMainExecutor(context),
+                    ) { location ->
+                        if (cont.isActive) {
+                            cont.resume(location?.let { GeoPoint(it.latitude, it.longitude) })
+                        }
+                    }
+                } catch (e: SecurityException) {
+                    if (cont.isActive) cont.resume(null)
+                } catch (e: IllegalArgumentException) {
+                    if (cont.isActive) cont.resume(null)
+                }
+            }
+        }
     }
 
     /** 粗定位就够算城市；细定位权限也认，有就用。 */

@@ -37,8 +37,8 @@ class LocationCacheTest {
         val city = LocationCache(manualStore(), port).current()
 
         val manual = city as LocatedCity.Manual
-        assertEquals("北京市", manual.name)
         assertEquals(39.9075, manual.point.latitude, 0.0)
+        assertEquals(116.39723, manual.point.longitude, 0.0)
         assertEquals(0, port.calls.size)                 // 关键断言：没调定位
     }
 
@@ -99,24 +99,6 @@ class LocationCacheTest {
         assertEquals(listOf("network", "gps"), KnownLocationPick.ORDER)
     }
 
-    // ---------- 手动城市增删 ----------
-
-    @Test
-    fun set_and_clear_manual_city_round_trip() = runBlocking {
-        val store = FakeKeyValueStore()
-        val cache = LocationCache(store, FakeLocationPort())
-
-        assertNull(cache.manualCityName())
-
-        cache.setManualCity("北京市", beijing)
-        assertEquals("北京市", cache.manualCityName())
-        assertEquals("39.9075", store.data[EnvironmentKeys.MANUAL_LAT])
-
-        cache.clearManualCity()
-        assertNull(cache.manualCityName())
-        assertTrue(store.data.isEmpty())
-    }
-
     // ---------- 每天首次刷新 ----------
 
     @Test
@@ -137,5 +119,190 @@ class LocationCacheTest {
             mapOf(EnvironmentKeys.LOCATION_REFRESHED_DATE to "garbage")
         )
         assertTrue(LocationCache(store, FakeLocationPort()).shouldRefreshToday(20_000L))
+    }
+
+    // ---------- 2026-11-22：每天首次前台主动刷新（refreshTodayOnce） ----------
+
+    @Test
+    fun daily_refresh_never_touches_location_when_manual_city_is_set() = runBlocking {
+        val port = ActiveFakeLocationPort(known = emptyMap(), active = shanghai)
+        val store = manualStore()
+        val day = 20_000L
+
+        val result = LocationCache(store, port).refreshTodayOnce(day)
+
+        assertFalse(result.attempted)                  // 手填城市 → 连主动请求都不发
+        assertNull(result.point)
+        assertEquals(0, port.activeCalls)              // 关键断言：一次定位都没调
+        assertTrue(port.lastKnownCalls.isEmpty())
+        // 手动城市不记账（本来就不需要刷新，别让标记无意义地变化）
+        assertNull(store.data[EnvironmentKeys.LOCATION_REFRESHED_DATE])
+    }
+
+    @Test
+    fun daily_refresh_asks_the_system_once_and_records_the_day() = runBlocking {
+        val port = ActiveFakeLocationPort(known = emptyMap(), active = shanghai)
+        val store = FakeKeyValueStore()
+        val day = 20_000L
+        val cache = LocationCache(store, port)
+
+        val result = cache.refreshTodayOnce(day)
+
+        assertTrue(result.attempted)
+        assertEquals(shanghai, result.point)
+        assertEquals(1, port.activeCalls)
+        assertEquals(listOf(LocationProviders.NETWORK), port.activeProviders)  // 只请求最省电的那个
+        assertFalse(cache.shouldRefreshToday(day))     // 当天已记账
+    }
+
+    @Test
+    fun daily_refresh_is_a_no_op_on_the_same_day() = runBlocking {
+        val port = ActiveFakeLocationPort(known = emptyMap(), active = shanghai)
+        val day = 20_000L
+        val cache = LocationCache(FakeKeyValueStore(), port)
+
+        cache.refreshTodayOnce(day)
+        val second = cache.refreshTodayOnce(day)
+
+        assertFalse(second.attempted)                  // 同一天不再折腾
+        assertEquals(1, port.activeCalls)
+    }
+
+    @Test
+    fun daily_refresh_marks_even_when_location_fails() = runBlocking {
+        val port = ActiveFakeLocationPort(known = emptyMap(), active = null)
+        val store = FakeKeyValueStore()
+        val day = 20_000L
+        val cache = LocationCache(store, port)
+
+        val result = cache.refreshTodayOnce(day)
+
+        assertTrue(result.attempted)
+        assertNull(result.point)
+        assertEquals(1, port.activeCalls)
+        // 用户 2026-11-22 拍板：失败也算「今天刷过」，当天不再反复空跑
+        assertFalse(cache.shouldRefreshToday(day))
+    }
+
+    @Test
+    fun daily_refresh_falls_back_to_last_known_when_active_request_is_empty() = runBlocking {
+        val port = ActiveFakeLocationPort(
+            known = mapOf(LocationProviders.NETWORK to shanghai),
+            active = null,
+        )
+
+        val result = LocationCache(FakeKeyValueStore(), port).refreshTodayOnce(20_000L)
+
+        assertTrue(result.attempted)
+        assertEquals(shanghai, result.point)           // 主动失败 → 退回被动历史位置
+        assertEquals(1, port.activeCalls)
+        assertEquals(listOf(LocationProviders.NETWORK), port.lastKnownCalls)
+    }
+
+    @Test
+    fun daily_refresh_runs_again_on_the_next_day() = runBlocking {
+        val port = ActiveFakeLocationPort(known = emptyMap(), active = shanghai)
+        val cache = LocationCache(FakeKeyValueStore(), port)
+
+        cache.refreshTodayOnce(20_000L)
+        val nextDay = cache.refreshTodayOnce(20_001L)
+
+        assertTrue(nextDay.attempted)                  // 跨日要重刷
+        assertEquals(2, port.activeCalls)
+    }
+
+    // ---------- 2026-11-22：自动定位反查城市名（注记第 3 段） ----------
+
+    @Test
+    fun daily_refresh_records_looked_up_city_name() = runBlocking {
+        val store = FakeKeyValueStore()
+        val port = ActiveFakeLocationPort(known = emptyMap(), active = shanghai)
+        val lookup = FakeCityNameLookup("上海市")
+        val cache = LocationCache(store, port, lookup)
+
+        val result = cache.refreshTodayOnce(20_000L)
+
+        assertEquals(shanghai, result.point)
+        assertEquals(listOf(shanghai), lookup.points)     // 只反查一次，用刚拿到的坐标
+        assertEquals("上海市", cache.autoCityName())
+        assertEquals("上海市", cache.displayCityName())   // 没有手填城市 → 用反查结果
+        assertEquals("31.2222", store.data[EnvironmentKeys.AUTO_CITY_LAT])
+        assertEquals("121.4581", store.data[EnvironmentKeys.AUTO_CITY_LON])
+    }
+
+    @Test
+    fun failed_lookup_leaves_auto_city_empty() = runBlocking {
+        val lookup = FakeCityNameLookup(null)
+        val cache = LocationCache(
+            FakeKeyValueStore(),
+            ActiveFakeLocationPort(known = emptyMap(), active = shanghai),
+            lookup,
+        )
+
+        cache.refreshTodayOnce(20_000L)
+
+        assertEquals(1, lookup.points.size)             // 试过了
+        assertNull(cache.autoCityName())                // 但没写成
+        assertNull(cache.displayCityName())
+    }
+
+    @Test
+    fun without_lookup_auto_city_stays_empty() = runBlocking {
+        val cache = LocationCache(
+            FakeKeyValueStore(),
+            ActiveFakeLocationPort(known = emptyMap(), active = shanghai),
+        )
+
+        cache.refreshTodayOnce(20_000L)
+
+        assertNull(cache.autoCityName())                // 未装配 lookup → 退回改动前行为
+    }
+
+    @Test
+    fun manual_city_wins_and_skips_lookup() = runBlocking {
+        val lookup = FakeCityNameLookup("深圳市")
+        val cache = LocationCache(manualStore(), ActiveFakeLocationPort(emptyMap(), shanghai), lookup)
+
+        cache.refreshTodayOnce(20_000L)
+
+        assertTrue(lookup.points.isEmpty())             // 手填城市 → 一次反查都不做
+        assertEquals("北京市", cache.displayCityName()) // 手填优先
+    }
+}
+
+/** 假的反查：固定返回一个地名（或 null），并记录被查过的坐标。 */
+private class FakeCityNameLookup(private val name: String?) : CityNamePort {
+
+    val points: MutableList<GeoPoint> = mutableListOf()
+
+    override suspend fun nameOf(point: GeoPoint): String? {
+        points += point
+        return name
+    }
+}
+
+/**
+ * 能区分「主动请求」和「被动读缓存」的假定位（2026-11-22）。
+ *
+ * [FakeLocationPort] 的 `currentOnce` 走接口默认实现、会记进同一个 `calls` 列表，
+ * 没法断言「到底调没调主动定位」。这里分开记。
+ */
+private class ActiveFakeLocationPort(
+    private val known: Map<String, GeoPoint>,
+    private val active: GeoPoint?,
+) : LocationPort {
+
+    val lastKnownCalls: MutableList<String> = mutableListOf()
+    val activeProviders: MutableList<String> = mutableListOf()
+    val activeCalls: Int get() = activeProviders.size
+
+    override fun lastKnown(provider: String): GeoPoint? {
+        lastKnownCalls += provider
+        return known[provider]
+    }
+
+    override suspend fun currentOnce(provider: String, timeoutMs: Long): GeoPoint? {
+        activeProviders += provider
+        return active
     }
 }

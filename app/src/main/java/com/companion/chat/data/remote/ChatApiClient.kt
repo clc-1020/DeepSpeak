@@ -8,7 +8,9 @@ import com.companion.chat.data.remote.dto.ChatStreamChunk
 import com.companion.chat.data.remote.dto.ResponseFormat
 import com.companion.chat.data.remote.dto.ThinkingOption
 import com.companion.chat.data.remote.dto.TitleOption
+import com.companion.chat.data.remote.dto.ToolOption
 import com.companion.chat.data.remote.dto.UsageDto
+import com.companion.chat.domain.chat.CitationParser
 import com.google.gson.Gson
 import com.google.gson.JsonSyntaxException
 import kotlinx.coroutines.Dispatchers
@@ -60,14 +62,23 @@ class ChatApiClient(
         var firstTokenMs: Long? = null
         var lastTokenMs: Long = 0L
 
+        // 联网搜索：只有 DeepSeek 官方兼容端点 + deepseek-flash 才认这个服务端工具。
+        // UI 层已置灰过一遍，这里**再判一次**（防御性重复）：即使 UI 漏判也绝不把工具发给不认识的端点。
+        val webSearchSupported = opts.webSearchEnabled &&
+            ProviderPresets.isDeepSeekCompatible(config.providerId, config.baseUrl) &&
+            config.model == "deepseek-flash"
+
         val payload = ChatRequest(
             model = config.model,
             messages = MultimodalRequestBuilder.build(messages, images),
             temperature = opts.temperature,
             responseFormat = if (opts.jsonMode) ResponseFormat() else null,
-            title = if (opts.titleEnabled) TitleOption() else null,
+            // 官方契约：联网工具（deepseek_web_search）**不能和 title 同传**，同传会 400。
+            // 所以联网轮次强制丢掉 title；title 生成的兜底（前缀标题）由 ChatViewModel 负责。
+            title = if (opts.titleEnabled && !webSearchSupported) TitleOption() else null,
             thinking = buildThinking(config, opts),
-            reasoningEffort = if (opts.thinkingEnabled) opts.reasoningEffort else null
+            reasoningEffort = if (opts.thinkingEnabled) opts.reasoningEffort else null,
+            tools = if (webSearchSupported) listOf(ToolOption("deepseek_web_search")) else null
         )
         // V1.8.0 诊断（临时）：打印真实请求体规模与最后一条消息 content 的结构。
         // android.util.Log 在 JVM 单测里是未实现 stub，必须 runCatching 兜住。
@@ -104,6 +115,13 @@ class ChatApiClient(
                     val deltaDto = chunk.choices.firstOrNull()?.delta
                     deltaDto?.title?.takeIf { it.isNotBlank() }?.let {
                         trySend(StreamEvent.Title(it))
+                    }
+                    // 联网引用：从 delta.annotations 提取。解析容错，坏帧只影响本帧引用，不影响正文。
+                    deltaDto?.annotations?.let { ann ->
+                        val cites = CitationParser.parse(ann)
+                        if (cites.isNotEmpty()) {
+                            trySend(StreamEvent.Citations(cites))
+                        }
                     }
                     val delta = deltaDto?.content
                     if (!delta.isNullOrEmpty()) {

@@ -8,11 +8,13 @@ package com.companion.chat.data.remote
  * @param thinkingEnabled 是否开思考（deepseek-flash 默认开，陪伴要显式关）
  * @param reasoningEffort 思考强度 low/high/max，仅 thinkingEnabled=true 时生效
  * @param temperature    采样温度，null 用服务端默认
+ * @param webSearchEnabled 是否启用联网搜索（DeepSeek 服务端工具 deepseek_web_search；仅 flash 可用）
  */
 data class ChatOptions(
     val jsonMode: Boolean = false,
     val titleEnabled: Boolean = false,
     val thinkingEnabled: Boolean = false,
     val reasoningEffort: String? = null,
-    val temperature: Double? = null
+    val temperature: Double? = null,
+    val webSearchEnabled: Boolean = false
 )

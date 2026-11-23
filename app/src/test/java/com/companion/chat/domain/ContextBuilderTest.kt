@@ -2,6 +2,7 @@ package com.companion.chat.domain
 
 import com.companion.chat.data.local.entity.MessageEntity
 import com.companion.chat.data.local.entity.MessageRole
+import com.companion.chat.domain.chat.ChatMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -177,5 +178,53 @@ class ContextBuilderTest {
             contextWindow = 65536
         )
         assertTrue(result.first().content.none { it == '【' })
+    }
+
+    // ---- 2026-11-22：正常模式（只问答，不注入陪伴向内容） ----
+
+    @Test
+    fun normal_mode_drops_whole_system_prefix() {
+        val result = ContextBuilder.build(
+            persona = "你是温柔的猫娘",
+            longMemoryDigest = "用户对花生过敏",
+            history = emptyList(),
+            currentUserText = "这段 Kotlin 为什么崩",
+            contextWindow = 65536,
+            capabilityNote = ContextBuilder.CAPABILITIES,
+            relationshipNote = "你们已经很亲近了",
+            mode = ChatMode.NORMAL
+        )
+
+        assertTrue(result.none { it.role == MessageRole.SYSTEM })   // 一个 system 都没有
+        assertEquals(1, result.size)                                // 只剩本轮 user
+        assertEquals(MessageRole.USER, result.single().role)
+    }
+
+    @Test
+    fun normal_mode_keeps_history_and_reminder() {
+        val history = listOf(
+            msg("user", "第一问"),
+            msg("assistant", "第一个回答"),
+        )
+        val result = ContextBuilder.build(
+            persona = "人设",
+            history = history,
+            currentUserText = "再问一句",
+            currentReminder = "2026-11-22,星期六",
+            contextWindow = 65536,
+            memoryBlock = "【记忆】无关内容",
+            emotionBlock = "【情绪】低落",
+            mode = ChatMode.NORMAL
+        )
+
+        // 历史照带（正常模式的历史本来就是干净问答，隔离靠独立会话）
+        assertEquals(MessageRole.USER, result[0].role)
+        assertEquals(MessageRole.ASSISTANT, result[1].role)
+        // 本轮 reminder + user
+        assertEquals(MessageRole.REMINDER, result[2].role)
+        assertEquals("再问一句", result.last().content)
+        // 记忆块 / 情绪块一律不进
+        assertTrue(result.none { it.content.contains("【记忆】") })
+        assertTrue(result.none { it.content.contains("【情绪】") })
     }
 }

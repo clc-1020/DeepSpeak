@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Build
 import android.widget.Toast
 import java.io.File
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -25,11 +27,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -38,6 +43,9 @@ import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -48,6 +56,7 @@ import com.companion.chat.data.image.HeicToJpeg
 import com.companion.chat.data.image.readFileHead
 import com.companion.chat.data.remote.ImageFormats
 import com.companion.chat.data.speech.SttManager
+import com.companion.chat.domain.chat.Citation
 import com.companion.chat.ui.permission.RecordPermission
 import com.companion.chat.ui.permission.rememberLocationPermission
 import com.companion.chat.ui.permission.rememberRecordPermission
@@ -56,7 +65,6 @@ import com.companion.chat.ui.speech.VoiceInputOverlay
 import com.companion.chat.ui.speech.VoiceState
 import com.companion.chat.ui.theme.LocalChatColors
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.withTimeoutOrNull
 
 /** 单轮最多发送图片数 */
 private const val MAX_IMAGES = 10
@@ -64,7 +72,7 @@ private const val MAX_IMAGES = 10
 /** 语音录音上划取消阈值（V2.3.4）。80dp 约等于拇指半节，误触与真取消都够用。 */
 private val VOICE_CANCEL_THRESHOLD = 80.dp
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
 @Composable
 fun ChatScreen(
     messages: List<MessageUiModel>,
@@ -74,6 +82,8 @@ fun ChatScreen(
     onNewChatClick: () -> Unit,
     onMemoryClick: () -> Unit,
     onOpenDrawer: () -> Unit,
+    /** 2026-11-23：顶栏日历入口 → 每日任务页。 */
+    onDailyTasksClick: () -> Unit = {},
     onVoiceClick: () -> Unit,
     /** V2.3.4：非空则麦克风按钮走「长按录音 → 松手识别」，为空时退回 [onVoiceClick]（无 STT 的兜底）。 */
     sttManager: SttManager? = null,
@@ -91,16 +101,36 @@ fun ChatScreen(
     /** V2.3.6：通知栏语音识别结果，非空时回填输入框（只填不发送）。 */
     voicePending: String? = null,
     onVoicePendingConsumed: () -> Unit = {},
+
     /** 流式输出中：撤回 / 重新生成 一律禁用（会和正在写入的临时消息打架）。 */
     isStreaming: Boolean = false,
     /** 撤回：删除这条 user 消息**及其之后的全部消息**（含紧随的 AI 回答）。 */
     onTruncateFrom: (Long) -> Unit = {},
     /** 重新生成：删掉最后一条 AI 回答重新问一遍。 */
     onRegenerate: () -> Unit = {},
+    /** 2026-11-23：输入栏工具（深度思考 / 智能搜索）。 */
+    thinkingEnabled: Boolean = false,
+    thinkingAvailable: Boolean = false,
+    onThinkingToggle: () -> Unit = {},
+    webSearchEnabled: Boolean = false,
+    webSearchAvailable: Boolean = false,
+    onWebSearchToggle: () -> Unit = {},
+    /** 联网搜索中（正文还没开始流），assistant 气泡显示「正在搜索…」。 */
+    searching: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     var messageInput by remember { mutableStateOf("") }
+
+    // 2026-11-23：输入框「是否被点开」用焦点判（不用键盘 insets —— 本机 MIUI 上 ime insets 恒为 0）。
+    // 发送键在「聚焦 或 有字」时出现；收起键盘靠 BackHandler 主动清焦点（Compose 里收键盘 TextField 不会自动失焦）。
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var inputFocused by remember { mutableStateOf(false) }
+    BackHandler(enabled = inputFocused) {
+        focusManager.clearFocus()
+        keyboardController?.hide()
+    }
 
     // 撤回不可恢复 → 必须二次确认；这里只暂存"待撤回的那条"，确认后才真正删
     var pendingRecall by remember { mutableStateOf<MessageUiModel?>(null) }
@@ -125,55 +155,36 @@ fun ChatScreen(
     val density = LocalDensity.current
     // V2.3.5：sttEnabled 必须进 remember 的 key（切开关要重建），并且关掉时要**真的不建 controller**——
     // controller 存在 ⇒ 下面的 voiceGestureModifier 就会挂着，等于「按钮藏了但手势还在监听」。
-    val voiceController = remember(sttManager, sttEnabled, density) {
-        if (!sttEnabled) {
-            null
-        } else {
-            sttManager?.let { manager ->
-                VoiceInputController(
-                    sttManager = manager,
-                    cancelThresholdPx = with(density) { VOICE_CANCEL_THRESHOLD.toPx() },
-                    onResult = { text -> messageInput = text },
-                    onError = { reason -> Toast.makeText(context, reason, Toast.LENGTH_SHORT).show() },
-                    onNotice = { notice -> Toast.makeText(context, notice, Toast.LENGTH_SHORT).show() }
-                )
+    // 2026-11-23：语音识别成功后**直接发送**，不回填输入框（用户明确要求「松手直接发送」）。
+        // 通知栏语音入口不走这里——它仍然只回填，见下面的 voicePending。
+        val voiceController = remember(sttManager, sttEnabled, density) {
+            if (!sttEnabled) {
+                null
+            } else {
+                sttManager?.let { manager ->
+                    VoiceInputController(
+                        sttManager = manager,
+                        cancelThresholdPx = with(density) { VOICE_CANCEL_THRESHOLD.toPx() },
+                        onResult = { text -> messageInput = text },
+                        onError = { reason -> Toast.makeText(context, reason, Toast.LENGTH_SHORT).show() },
+                        onNotice = { notice -> Toast.makeText(context, notice, Toast.LENGTH_SHORT).show() }
+                    )
+                }
             }
         }
-    }
     // 页面销毁时一定要释放麦克风（否则下一个进程/下一次长按都抢不到麦）
     DisposableEffect(voiceController) {
         onDispose { voiceController?.release() }
     }
 
-    // 长按麦克风的手势：等长按超时 → 开麦 → 跟踪位移（上划取消）→ 松手收尾
+    // 语音手势（2026-11-23：改成「按下即录」——去掉长按等待，手指一按立刻开麦；按住上划取消；松手识别并回填输入框）
     val voiceGestureModifier: Modifier? = voiceController?.let { controller ->
         Modifier.pointerInput(controller) {
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
 
-                // 长按超时前松手 = 单击；手指移出 touchSlop = 想滑动，都不进录音
-                val releasedEarly: Boolean? = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
-                    var early = false
-                    while (!early) {
-                        val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull { it.id == down.id }
-                        if (change == null || !change.pressed) {
-                            early = true
-                            break
-                        }
-                        if ((change.position - down.position).getDistance() > viewConfiguration.touchSlop) {
-                            early = true
-                        }
-                    }
-                    early
-                }
-                if (releasedEarly != null) return@awaitEachGesture
-
-                // 录音是用户主动动作：只在真正长按时才要权限。
-                // 用 RecordPermission.isGranted(context) 现查而不读 remember 里的快照：
-                // 授权后不保证触发本函数重组，读快照会一直停在 false，长按永远开不了麦。
+                // 录音是用户主动动作：按下立刻要权限（不再等长按超时；识别失败只提示不发送）
                 if (!RecordPermission.isGranted(context)) {
-                    // 系统已不再弹框（授权被彻底拒绝）时给出明确引导，不静默失败
                     if (!RecordPermission.canPrompt(context)) {
                         Toast.makeText(context, "请在系统设置里允许录音权限", Toast.LENGTH_SHORT).show()
                     }
@@ -265,7 +276,8 @@ fun ChatScreen(
                 dndEnabled = dndEnabled,
                 onNewChatClick = onNewChatClick,
                 onMemoryClick = onMemoryClick,
-                onOpenDrawer = onOpenDrawer
+                onOpenDrawer = onOpenDrawer,
+                onDailyTasksClick = onDailyTasksClick
             )
         },
         bottomBar = {
@@ -318,7 +330,15 @@ fun ChatScreen(
                     },
                     onVoiceClick = onVoiceClick,
                     voiceGesture = voiceGestureModifier,
-                    sttEnabled = sttEnabled
+                    sttEnabled = sttEnabled,
+                    thinkingEnabled = thinkingEnabled,
+                    thinkingAvailable = thinkingAvailable,
+                    onThinkingToggle = onThinkingToggle,
+                    webSearchEnabled = webSearchEnabled,
+                    webSearchAvailable = webSearchAvailable,
+                    onWebSearchToggle = onWebSearchToggle,
+                    inputFocused = inputFocused,
+                    onInputFocusChanged = { inputFocused = it }
                 )
             }
         },
@@ -328,6 +348,8 @@ fun ChatScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
+                // 点消息区空白 → 收起键盘、退回麦克风（配合焦点方案）
+                .pointerInput(Unit) { detectTapGestures { focusManager.clearFocus() } }
         ) {
             if (messages.isEmpty()) {
                 EmptyState()
@@ -338,6 +360,7 @@ fun ChatScreen(
                     onReadAloud = onReadAloud,
                     speakingId = speakingId,
                     actionsEnabled = !isStreaming,
+                    searching = searching,
                     onRecall = { pendingRecall = it },
                     onRegenerate = onRegenerate
                 )
@@ -417,7 +440,8 @@ private fun TopBar(
     dndEnabled: Boolean,
     onNewChatClick: () -> Unit,
     onMemoryClick: () -> Unit,
-    onOpenDrawer: () -> Unit
+    onOpenDrawer: () -> Unit,
+    onDailyTasksClick: () -> Unit = {}
 ) {
     TopAppBar(
         title = {},
@@ -428,6 +452,10 @@ private fun TopBar(
                 }
                 IconButton(onClick = onSettingsClick) {
                     Icon(imageVector = Icons.Default.Settings, contentDescription = "设置")
+                }
+                // 2026-11-23：每日任务入口——简笔画风格日历，紧挨设置右边
+                IconButton(onClick = onDailyTasksClick) {
+                    Icon(imageVector = Icons.Outlined.CalendarMonth, contentDescription = "每日任务")
                 }
             }
         },
@@ -492,6 +520,7 @@ private fun MessageList(
     onReadAloud: (Long, String) -> Unit,
     speakingId: Long?,
     actionsEnabled: Boolean,
+    searching: Boolean,
     onRecall: (MessageUiModel) -> Unit,
     onRegenerate: () -> Unit
 ) {
@@ -507,6 +536,7 @@ private fun MessageList(
                 onReadAloud = onReadAloud,
                 speakingId = speakingId,
                 actionsEnabled = actionsEnabled,
+                searching = searching,
                 // 只有最后一条 assistant 消息能「重新生成」，否则后面的对话会变成孤儿
                 canRegenerate = message.id == lastId && !message.isUser,
                 onRecall = { onRecall(message) },
@@ -522,6 +552,7 @@ private fun MessageBubble(
     onReadAloud: (Long, String) -> Unit,
     speakingId: Long?,
     actionsEnabled: Boolean,
+    searching: Boolean,
     canRegenerate: Boolean,
     onRecall: () -> Unit,
     onRegenerate: () -> Unit
@@ -564,6 +595,26 @@ private fun MessageBubble(
                         modifier = Modifier.padding(6.dp),
                         fontSize = 16.sp
                     )
+                }
+
+                // 联网搜索中、正文还没开始流 → 气泡里先显示「正在搜索…」（流式期间提示）
+                if (message.content.isBlank() && message.id < 0 && searching) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(6.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "正在搜索…",
+                            fontSize = 15.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
 
                 // ---- 常驻操作行：复制 / 撤回|重新生成 / 朗读 ----
@@ -617,10 +668,16 @@ private fun MessageBubble(
                         }
                     }
                 }
+
+                // 联网引用：灰色小字，默认折叠，点开看来源（2026-11-23）
+                if (!message.isUser && message.citations.isNotEmpty()) {
+                    CitationsBlock(citations = message.citations)
+                }
             }
         }
     }
 }
+
 
 /** 气泡里的 18dp 小图标按钮（复制 / 撤回 / 重新生成），点按区域 34dp。 */
 @Composable
@@ -658,6 +715,75 @@ private fun copyMessage(context: Context, text: String) {
     }
 }
 
+/**
+ * 联网引用块（2026-11-23）：气泡下方灰色小字「N 个来源 ▾」，默认折叠；
+ * 点开逐条列出（标题 + 域名），再点用系统浏览器打开。参照 DeepSeek 官方样式。
+ */
+@Composable
+private fun CitationsBlock(citations: List<Citation>) {
+    var expanded by remember { mutableStateOf(false) }
+    val uriHandler = LocalUriHandler.current
+    val grey = MaterialTheme.colorScheme.onSurfaceVariant
+    Column(modifier = Modifier.padding(start = 2.dp, end = 2.dp, top = 6.dp)) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .clickable { expanded = !expanded }
+                .padding(vertical = 2.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.Language,
+                contentDescription = null,
+                tint = grey.copy(alpha = 0.8f),
+                modifier = Modifier.size(14.dp)
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = "${citations.size} 个来源",
+                fontSize = 12.sp,
+                color = grey.copy(alpha = 0.85f)
+            )
+            Icon(
+                imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                contentDescription = if (expanded) "收起来源" else "展开来源",
+                tint = grey.copy(alpha = 0.85f),
+                modifier = Modifier.size(16.dp)
+            )
+        }
+        if (expanded) {
+            Spacer(modifier = Modifier.height(2.dp))
+            citations.forEachIndexed { index, c ->
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { runCatching { uriHandler.openUri(c.url) } }
+                        .padding(vertical = 3.dp)
+                ) {
+                    Text(text = "${index + 1}.", fontSize = 12.sp, color = grey.copy(alpha = 0.7f))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = c.displayLabel,
+                            fontSize = 12.sp,
+                            color = grey.copy(alpha = 0.9f),
+                            maxLines = 1
+                        )
+                        Text(
+                            text = c.host,
+                            fontSize = 11.sp,
+                            color = grey.copy(alpha = 0.6f),
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun InputBar(
     message: String,
@@ -667,12 +793,24 @@ private fun InputBar(
     onRemoveImage: (Uri) -> Unit,
     onSend: () -> Unit,
     onVoiceClick: () -> Unit,
-    /** 非空时麦克风换成「长按录音」手势（V2.3.4），此时不再挂 click。 */
+    /** 非空时麦克风换成「按下即录」手势（2026-11-23：去掉长按等待），此时不再挂 click。 */
     voiceGesture: Modifier? = null,
     /** V2.3.5：语音输入总开关，关掉时整颗麦克风按钮不渲染（左侧「+」布局保持靠左）。 */
-    sttEnabled: Boolean = true
+    sttEnabled: Boolean = true,
+    // ---- 2026-11-23：输入栏工具胶囊（深度思考 / 智能搜索）----
+    thinkingEnabled: Boolean = false,
+    thinkingAvailable: Boolean = false,
+    onThinkingToggle: () -> Unit = {},
+    webSearchEnabled: Boolean = false,
+    webSearchAvailable: Boolean = false,
+    onWebSearchToggle: () -> Unit = {},
+    /** 输入框是否被点开（焦点）。发送键 = 聚焦 或 有字。 */
+    inputFocused: Boolean = false,
+    onInputFocusChanged: (Boolean) -> Unit = {}
 ) {
     val canSend = message.isNotBlank() || selectedUris.isNotEmpty()
+    // 发送键出现条件：点了输入框(聚焦) 或 已有内容（如通知栏语音填进来的字）——后者出现在原麦克风位置
+    val showSend = inputFocused || canSend
     // 中性灰面板（不跟随动态取色的紫色），亮/暗主题都能用
     val fieldColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)
     // 发送键/光标的 accent 走色板（深=#7797EC / 浅=#467CF6）
@@ -711,7 +849,8 @@ private fun InputBar(
                 onValueChange = onMessageChange,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 4.dp),
+                    .padding(vertical = 4.dp)
+                    .onFocusChanged { onInputFocusChanged(it.isFocused) },
                 textStyle = MaterialTheme.typography.bodyLarge.copy(
                     fontSize = 16.sp,
                     color = MaterialTheme.colorScheme.onSurface
@@ -732,13 +871,31 @@ private fun InputBar(
                 }
             )
 
-            // 底部工具行：左「+」，右侧「语音 / 发送」
+            // 底部工具行：左「深度思考 / 智能搜索」两颗胶囊，右侧「+」和「麦克风 / 发送」（同一个位子）
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                ToolChip(
+                    label = "深度思考",
+                    icon = Icons.Default.Lightbulb,
+                    selected = thinkingEnabled,
+                    enabled = thinkingAvailable,
+                    onClick = onThinkingToggle
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                ToolChip(
+                    label = "智能搜索",
+                    icon = Icons.Default.Language,
+                    selected = webSearchEnabled,
+                    enabled = webSearchAvailable,
+                    onClick = onWebSearchToggle
+                )
+
+                Spacer(modifier = Modifier.weight(1f))
+
                 RoundIconButton(onClick = onPickImages) {
                     Icon(
                         imageVector = Icons.Default.Add,
@@ -747,12 +904,32 @@ private fun InputBar(
                         tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                Spacer(modifier = Modifier.width(10.dp))
 
-                Spacer(modifier = Modifier.weight(1f))
-
-                // 输入栏改版（2026-11-21）：麦克风与发送键**常驻并排**，不再「有字才冒出发送键」。
-                // 空输入时发送键置灰且不挂 click（点了无反应，不弹 Toast）。
-                if (sttEnabled) {
+                // 麦克风 / 发送 共用同一个位子（2026-11-23）：
+                //  - 聚焦 或 有字 → 发送箭头（无字则置灰、不挂 click）
+                //  - 否则 → 麦克风（按下即录）
+                if (showSend) {
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (canSend) palette.accentFill
+                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                            )
+                            .then(if (canSend) Modifier.clickable(onClick = onSend) else Modifier),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ArrowUpward,
+                            contentDescription = if (canSend) "发送" else "发送（尚未输入内容）",
+                            modifier = Modifier.size(20.dp),
+                            tint = if (canSend) MaterialTheme.colorScheme.onPrimary
+                            else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                        )
+                    }
+                } else if (sttEnabled) {
                     RoundIconButton(
                         onClick = if (voiceGesture == null) onVoiceClick else null,
                         modifier = voiceGesture ?: Modifier
@@ -764,38 +941,68 @@ private fun InputBar(
                             tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                    Spacer(modifier = Modifier.width(10.dp))
-                }
-                Box(
-                    modifier = Modifier
-                        .size(34.dp)
-                        .clip(CircleShape)
-                        .background(
-                            if (canSend) {
-                                // 1.9.0：图形填充走色板 accentFill（深=#7797EC / 浅=#467CF6）
-                                palette.accentFill
-                            } else {
-                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
-                            }
+                } else {
+                    // 语音输入关闭且无字：仍给一个置灰发送键占位，避免右侧空一块
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ArrowUpward,
+                            contentDescription = "发送（尚未输入内容）",
+                            modifier = Modifier.size(20.dp),
+                            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
                         )
-                        .then(if (canSend) Modifier.clickable(onClick = onSend) else Modifier),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.ArrowUpward,
-                        contentDescription = if (canSend) "发送" else "发送（尚未输入内容）",
-                        modifier = Modifier.size(20.dp),
-                        tint = if (canSend) {
-                            MaterialTheme.colorScheme.onPrimary
-                        } else {
-                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                        }
-                    )
+                    }
                 }
             }
         }
     }
 }
+
+/** 输入栏的工具胶囊（深度思考 / 智能搜索）。enabled=false 时置灰、点不动。 */
+@Composable
+private fun ToolChip(
+    label: String,
+    icon: ImageVector,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    val palette = LocalChatColors.current
+    val accent = palette.accentFill
+    val contentColor = when {
+        !enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
+        selected -> accent
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val bg = when {
+        !enabled -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f)
+        selected -> accent.copy(alpha = 0.14f)
+        else -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(bg)
+            .then(if (enabled) Modifier.clickable(onClick = onClick) else Modifier)
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = contentColor,
+            modifier = Modifier.size(15.dp)
+        )
+        Spacer(modifier = Modifier.width(4.dp))
+        Text(text = label, fontSize = 12.sp, color = contentColor)
+    }
+}
+
 
 /** 输入框内的圆形小按钮（+ / 麦克风）。onClick 为 null 时只渲染、不挂 click（由外部挂手势）。 */
 @Composable
@@ -876,7 +1083,9 @@ data class MessageUiModel(
     val isUser: Boolean,
     val timestamp: Long,
     /** 该消息附带的本地图片文件路径（多图），气泡据此渲染图片 */
-    val imagePaths: List<String> = emptyList()
+    val imagePaths: List<String> = emptyList(),
+    /** 联网搜索引用（仅 assistant 消息可能有），灰色折叠来源 */
+    val citations: List<Citation> = emptyList()
 )
 
 /**

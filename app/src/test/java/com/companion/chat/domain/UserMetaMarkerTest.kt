@@ -34,6 +34,33 @@ class UserMetaMarkerTest {
         assertEquals("2024-01-01,Monday,,Web,en", s)
     }
 
+    // ---- 2026-11-22：正常模式的注记（段数必须仍是 5，只填前两段） ----
+
+    /**
+     * **回归：段数必须是 5，且后三段不能为空。**
+     *
+     * 第一版发成 2 段（`2024-01-01,星期一`）→ 真机 400；
+     * 第二版发成 5 段但把 2/3/4 段留空（`2024-01-01,星期一,,,`）→ **仍然 400**。
+     * 结论：这个字段形状固定，**空字段也不被接受**。
+     */
+    @Test
+    fun normal_mode_still_has_five_fields() {
+        val s = UserMetaMarker.buildNormal(date = monday)
+        assertEquals("2024-01-01,星期一,,App,中文", s)
+        assertEquals(5, s.split(",").size)
+    }
+
+    @Test
+    fun normal_mode_follows_language() {
+        assertEquals("2024-01-01,Monday,,App,en", UserMetaMarker.buildNormal(date = monday, language = "en"))
+    }
+
+    @Test
+    fun normal_mode_carries_no_location_or_weather() {
+        val fields = UserMetaMarker.buildNormal(date = monday).split(",")
+        assertEquals("", fields[2])   // 地点 + 天气：陪伴语义，问答不带
+    }
+
     @Test
     fun weekday_mapping() {
         assertEquals("星期一", UserMetaMarker.weekday(monday, "中文"))

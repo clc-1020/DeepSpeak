@@ -6,6 +6,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.companion.chat.data.remote.ApiConfig
 import com.companion.chat.data.remote.ProviderPresets
+import com.companion.chat.domain.chat.ChatMode
 import com.companion.chat.domain.settings.DndSettings
 import com.companion.chat.domain.proactive.ProactiveGateRules
 import com.companion.chat.domain.settings.EnvironmentSettings
@@ -88,6 +89,9 @@ class ConfigRepository(context: Context) {
 
     fun getApiKey(): String = prefs.getString(KEY_API_KEY, "") ?: ""
 
+    /** 深度思考开关（2026-11-23：开关 UI 已搬到聊天输入栏，这里只负责持久化读写）。 */
+    fun getThinkingEnabled(): Boolean = prefs.getBoolean(KEY_THINKING_ENABLED, false)
+
     fun hasApiKey(): Boolean = getApiKey().isNotBlank()
 
     fun clear() {
@@ -142,6 +146,20 @@ class ConfigRepository(context: Context) {
     fun getDeepRecallEnabled(): Boolean = prefs.getBoolean(KEY_DEEP_RECALL, true)
     fun setDeepRecallEnabled(enabled: Boolean) =
         prefs.edit().putBoolean(KEY_DEEP_RECALL, enabled).apply()
+
+    // ---------- 对话模式（2026-11-22） ----------
+
+    /**
+     * 当前对话模式。默认 [ChatMode.COMPANION]（陪聊），也是老用户一直以来的行为。
+     *
+     * 存在这里而不是 `app_state`：它是"一项设置"，跟人设/开关同类；
+     * 而"哪个会话属于该模式"是运行状态，放 `app_state`（见 `ChatViewModel`）。
+     */
+    fun getChatMode(): ChatMode =
+        ChatMode.fromStorage(prefs.getString(KEY_CHAT_MODE, null))
+
+    fun setChatMode(mode: ChatMode) =
+        prefs.edit().putString(KEY_CHAT_MODE, mode.storageValue).apply()
 
     // ---------- 主动消息语音 + 勿扰（任务 4.3） ----------
 
@@ -289,6 +307,8 @@ class ConfigRepository(context: Context) {
         private const val KEY_STT_ENABLED = "stt_enabled"
         private const val KEY_QUICK_ACCESS_ENABLED = "quick_access_enabled"
         private const val KEY_DEEP_RECALL = "deep_recall_enabled"
+        /** 对话模式：`companion`（默认）/ `normal`。2026-11-22。 */
+        private const val KEY_CHAT_MODE = "chat_mode"
         private const val KEY_TTS_SPEECH_RATE = "tts_speech_rate"
         private const val KEY_TTS_SYSTEM_ENGINE = "tts_system_engine"
         private const val KEY_PROACTIVE_VOICE = "proactive_voice_enabled"

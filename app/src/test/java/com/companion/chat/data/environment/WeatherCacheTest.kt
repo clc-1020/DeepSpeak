@@ -346,4 +346,116 @@ class WeatherCacheTest {
         assertNull(snap)
         assertEquals(0, server.requestCount)
     }
+
+    // ---------- 2026-11-22：peekBundle（整点检查用，缓存新鲜时不碰定位） ----------
+
+    @Test
+    fun peek_bundle_returns_both_days_from_fresh_cache() = runBlocking {
+        val store = FakeKeyValueStore(
+            mapOf(
+                EnvironmentKeys.WEATHER_CACHE_JSON to sampleJson,
+                EnvironmentKeys.WEATHER_CACHE_AT to (now - 3_600_000L).toString(),
+            )
+        )
+
+        val bundle = cache(store).peekBundle(today)
+
+        assertEquals(0, server.requestCount)     // 绝不联网
+        assertEquals(13, bundle.today?.tempMax)
+        assertEquals(10, bundle.yesterday?.tempMax)   // 整点检查要昨天算降温
+    }
+
+    @Test
+    fun peek_bundle_is_empty_without_cache_and_without_network() = runBlocking {
+        val bundle = cache(FakeKeyValueStore()).peekBundle(today)
+
+        assertEquals(0, server.requestCount)
+        assertNull(bundle.today)
+        assertNull(bundle.yesterday)
+    }
+
+    @Test
+    fun peek_bundle_is_empty_when_cache_is_stale() = runBlocking {
+        val store = FakeKeyValueStore(
+            mapOf(
+                EnvironmentKeys.WEATHER_CACHE_JSON to sampleJson,
+                EnvironmentKeys.WEATHER_CACHE_AT to (now - 25 * 3_600_000L).toString(),
+            )
+        )
+
+        val bundle = cache(store).peekBundle(today)
+
+        assertEquals(0, server.requestCount)
+        assertNull(bundle.today)
+    }
+
+    // ---------- 2026-11-22：缓存优先于坐标判空（后台天气钩子全哑的回归） ----------
+
+    /**
+     * 回归：后台拿不到定位（`point == null`）时，**新鲜缓存仍然必须能用**。
+     *
+     * 修之前 `load()` 第一行就是 `if (point == null) return EMPTY`，这行会把整点环境检查
+     * 里的天气直接丢掉 —— 自动定位模式下下雨/降温/高温钩子一次都不触发。
+     */
+    @Test
+    fun fresh_cache_is_used_even_without_a_coordinate() = runBlocking {
+        val store = FakeKeyValueStore(
+            mapOf(
+                EnvironmentKeys.WEATHER_CACHE_JSON to sampleJson,
+                EnvironmentKeys.WEATHER_CACHE_AT to (now - 3_600_000L).toString(),
+            )
+        )
+
+        val bundle = cache(store).load(point = null, today = today)
+
+        assertEquals(0, server.requestCount)     // 不联网
+        assertEquals(13, bundle.today?.tempMax)  // 缓存照常解析
+    }
+
+    /** 坐标刚刷新过 → `force = true` 必须无视新鲜缓存，立即重拉（否则还是旧城市的天气）。 */
+    @Test
+    fun force_ignores_fresh_cache_and_refetches() = runBlocking {
+        val otherCityJson = """
+            {
+              "latitude": 23.0, "longitude": 113.1,
+              "timezone": "Asia/Shanghai", "utc_offset_seconds": 28800,
+              "daily": {
+                "time": ["2026-11-19", "2026-11-20", "2026-11-21"],
+                "temperature_2m_max": [30.0, 31.0, 32.0],
+                "temperature_2m_min": [22.0, 23.0, 24.0],
+                "precipitation_probability_max": [90, 95, 99]
+              }
+            }
+        """.trimIndent()
+        enqueueJson(otherCityJson)
+
+        val store = FakeKeyValueStore(
+            mapOf(
+                EnvironmentKeys.WEATHER_CACHE_JSON to sampleJson,   // 旧城市（13°C）
+                EnvironmentKeys.WEATHER_CACHE_AT to now.toString(),
+            )
+        )
+
+        val bundle = cache(store).load(beijing, today, force = true)
+
+        assertEquals(1, server.requestCount)
+        assertEquals(31, bundle.today?.tempMax)     // 拿到新城市的数据
+        assertEquals(95, bundle.today?.precipProbabilityMax)
+    }
+
+    /** 强制重拉但一格坐标都没有 → 不发请求，返回空（绝不会拿旧城市缓存凑）。 */
+    @Test
+    fun force_without_coordinate_returns_empty_without_network() = runBlocking {
+        val store = FakeKeyValueStore(
+            mapOf(
+                EnvironmentKeys.WEATHER_CACHE_JSON to sampleJson,
+                EnvironmentKeys.WEATHER_CACHE_AT to now.toString(),
+            )
+        )
+
+        val bundle = cache(store).load(point = null, today = today, force = true)
+
+        assertEquals(0, server.requestCount)
+        assertNull(bundle.today)
+    }
 }

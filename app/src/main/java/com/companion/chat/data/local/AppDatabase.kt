@@ -8,6 +8,7 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.companion.chat.data.local.dao.AppStateDao
 import com.companion.chat.data.local.dao.ConversationDao
+import com.companion.chat.data.local.dao.DailyTaskDao
 import com.companion.chat.data.local.dao.MemoryDailyDao
 import com.companion.chat.data.local.dao.MemoryLongDao
 import com.companion.chat.data.local.dao.MemoryShortDao
@@ -16,6 +17,7 @@ import com.companion.chat.data.local.dao.PendingMessageDao
 import com.companion.chat.data.local.dao.ReminderDao
 import com.companion.chat.data.local.entity.AppStateEntity
 import com.companion.chat.data.local.entity.ConversationEntity
+import com.companion.chat.data.local.entity.DailyTaskEntity
 import com.companion.chat.data.local.entity.MemoryDailyEntity
 import com.companion.chat.data.local.entity.MemoryLongEntity
 import com.companion.chat.data.local.entity.MemoryShortEntity
@@ -37,9 +39,10 @@ import com.companion.chat.data.local.entity.ReminderEntity
         MemoryDailyEntity::class,
         ReminderEntity::class,
         PendingMessageEntity::class,
-        AppStateEntity::class
+        AppStateEntity::class,
+        DailyTaskEntity::class
     ],
-    version = 8,
+    version = 10,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -52,6 +55,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun reminderDao(): ReminderDao
     abstract fun pendingMessageDao(): PendingMessageDao
     abstract fun appStateDao(): AppStateDao
+    abstract fun dailyTaskDao(): DailyTaskDao
 
     companion object {
         private const val DB_NAME = "companion.db"
@@ -87,7 +91,39 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
-        @Volatile
+        /**
+         * v8 → v9（2026-11-23 联网引用）：messages 加 citations 列（可空 TEXT）。
+         * 可空 → 旧行自动 NULL（等价"这条消息没有联网引用"），零行为变化。
+         * 存 JSON 字符串而不是建表：引用是整条回复的附属品，不查询/不去重/不更新。
+         */
+        internal val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN citations TEXT")
+            }
+        }
+
+        /**
+         * v9 → v10（2026-11-23 每日任务）：新建 daily_tasks 表（默认空）。
+         * CREATE 语句必须与 Room 导出的 10.json 完全一致，否则迁移后 schema 校验失败。
+         */
+        internal val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `daily_tasks` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`text` TEXT NOT NULL, " +
+                        "`hour` INTEGER NOT NULL, " +
+                        "`minute` INTEGER NOT NULL, " +
+                        "`mode` TEXT NOT NULL, " +
+                        "`voiceEnabled` INTEGER NOT NULL, " +
+                        "`enabled` INTEGER NOT NULL, " +
+                        "`conversationId` INTEGER, " +
+                        "`createdAt` INTEGER NOT NULL)"
+                )
+            }
+        }
+
+                @Volatile
         private var INSTANCE: AppDatabase? = null
 
         fun getInstance(context: Context): AppDatabase {
@@ -97,7 +133,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     DB_NAME
                 )
-                    .addMigrations(MIGRATION_6_7, MIGRATION_7_8)
+                    .addMigrations(MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10)
                     // 已验证：6→7 显式迁移 + instrumented 测试全绿，移除破坏式回退（§3.1 / 步骤 7）
                     .build()
                     .also { INSTANCE = it }

@@ -1,5 +1,6 @@
 package com.companion.chat.data.proactive
 
+import com.companion.chat.data.environment.EnvironmentKeys
 import com.companion.chat.data.environment.FakeHttpText
 import com.companion.chat.data.environment.FakeKeyValueStore
 import com.companion.chat.data.environment.FakeLocationPort
@@ -141,6 +142,45 @@ class EnvironmentHookServiceTest {
             nowMillis = { nowMillis },
         )
         return service to dao
+    }
+
+        // ---------- 2026-11-22：缓存新鲜时不碰定位 ----------
+
+    /**
+     * 缓存新鲜 → 整点检查**一个定位都不读**。
+     *
+     * 修之前 `weatherBundle()` 每次先 `locationCache.current()`：而后台读位置在 Android 10+
+     * 必被拒，缓存新鲜的 23/24 小时里那次调用纯属白跑。
+     */
+    @Test
+    fun fresh_weather_cache_means_recall_never_touches_location() = runBlocking {
+        val nowMillis = at(day20, 10, 0)
+        val store = FakeKeyValueStore(
+            mapOf(
+                EnvironmentKeys.WEATHER_CACHE_JSON to sunnyJson,
+                EnvironmentKeys.WEATHER_CACHE_AT to (nowMillis - 60_000L).toString(),
+            )
+        )
+        val port = FakeLocationPort(mapOf(LocationProviders.NETWORK to beijing))
+        val weatherCache = WeatherCache(
+            store = store,
+            http = FakeHttpText.ok(sunnyJson),
+            nowMillis = { nowMillis },
+        )
+        val service = EnvironmentHookService(
+            ruleEngine = EnvironmentRuleEngine(),
+            appStateDao = FakeAppStateDao(store),
+            weatherCache = weatherCache,
+            locationCache = LocationCache(store, port),
+            queue = PendingMessageQueue(dao = FakePendingDao(), now = { nowMillis }),
+            enabled = { true },
+            zone = zone,
+            nowMillis = { nowMillis },
+        )
+
+        service.recall()
+
+        assertTrue(port.calls.isEmpty())
     }
 
     // ---------- 类型映射 ----------

@@ -3,6 +3,7 @@ package com.companion.chat.domain
 import com.companion.chat.data.local.entity.MessageEntity
 import com.companion.chat.data.local.entity.MessageRole
 import com.companion.chat.data.remote.dto.ChatMessageDto
+import com.companion.chat.domain.chat.ChatMode
 
 /**
  * 组装发给模型的上下文。任务 1.5 / 1.2 增补（latest_reminder + 稳定前缀）
@@ -55,30 +56,46 @@ object ContextBuilder {
          * 放**稳定前缀**是故意的：它几个月才变一次（要跨过消息数与认识天数的门槛），
          * 对前缀缓存几乎无影响；而它对"她该多亲近"的影响是全局的，放尾部每轮都白花 token。
          */
-        relationshipNote: String? = null
+        relationshipNote: String? = null,
+
+        /**
+         * 对话模式（2026-11-22）。
+         *
+         * [ChatMode.NORMAL] 下**只发 `历史 + 本轮 reminder + 本轮 user`**：
+         * 人设、能力说明、关系定位、长期记忆摘要、情绪块、记忆块**全部不组装**。
+         * 注释里的参数在这条分支里被忽略——调用方照样传也没关系，避免各处都写一遍 if。
+         *
+         * 历史之所以还留着：正常模式用**独立会话**（见 [ChatMode] 的注释），
+         * 它的历史本来就是干净的问答，隔离掉人格靠的是"换个会话"，不是"不发历史"。
+         */
+        mode: ChatMode = ChatMode.COMPANION
     ): List<ChatMessageDto> {
         val list = ArrayList<ChatMessageDto>(history.size * 2 + 3)
+        val companion = mode == ChatMode.COMPANION
 
-        // 1) 稳定前缀：人设 + 能力说明 + 长期记忆摘要
-        val systemText = buildString {
-            if (persona.isNotBlank()) append(persona.trim())
-            if (!capabilityNote.isNullOrBlank()) {
-                if (isNotEmpty()) append("\n\n")
-                append(capabilityNote.trim())
+        // 1) 稳定前缀：人设 + 能力说明 + 关系定位 + 长期记忆摘要
+        //    正常模式整段不组装 —— 这就是「不注入人格 / 记忆 / 关系」的落点。
+        if (companion) {
+            val systemText = buildString {
+                if (persona.isNotBlank()) append(persona.trim())
+                if (!capabilityNote.isNullOrBlank()) {
+                    if (isNotEmpty()) append("\n\n")
+                    append(capabilityNote.trim())
+                }
+                if (!relationshipNote.isNullOrBlank()) {
+                    if (isNotEmpty()) append("\n\n")
+                    append("【你们的关系】")
+                    append(relationshipNote.trim())
+                }
+                if (!longMemoryDigest.isNullOrBlank()) {
+                    if (isNotEmpty()) append("\n\n")
+                    append("【长期记忆】\n")
+                    append(longMemoryDigest.trim())
+                }
             }
-            if (!relationshipNote.isNullOrBlank()) {
-                if (isNotEmpty()) append("\n\n")
-                append("【你们的关系】")
-                append(relationshipNote.trim())
+            if (systemText.isNotBlank()) {
+                list.add(ChatMessageDto(MessageRole.SYSTEM, systemText))
             }
-            if (!longMemoryDigest.isNullOrBlank()) {
-                if (isNotEmpty()) append("\n\n")
-                append("【长期记忆】\n")
-                append(longMemoryDigest.trim())
-            }
-        }
-        if (systemText.isNotBlank()) {
-            list.add(ChatMessageDto(MessageRole.SYSTEM, systemText))
         }
 
         // 2) 历史消息：user 若带 reminder，则先回传再放 user
@@ -90,11 +107,14 @@ object ContextBuilder {
         }
 
         // 3) 本轮状态块（2026-11-21）：情绪 → 记忆，都在历史之后、user 之前 —— 保持前缀缓存命中
-        if (!emotionBlock.isNullOrBlank()) {
-            list.add(ChatMessageDto(MessageRole.SYSTEM, emotionBlock.trim()))
-        }
-        if (!memoryBlock.isNullOrBlank()) {
-            list.add(ChatMessageDto(MessageRole.SYSTEM, memoryBlock.trim()))
+        //    正常模式两块都不注入（情绪改"她怎么说"、记忆是"她说什么"，都是陪伴语义）。
+        if (companion) {
+            if (!emotionBlock.isNullOrBlank()) {
+                list.add(ChatMessageDto(MessageRole.SYSTEM, emotionBlock.trim()))
+            }
+            if (!memoryBlock.isNullOrBlank()) {
+                list.add(ChatMessageDto(MessageRole.SYSTEM, memoryBlock.trim()))
+            }
         }
 
         // 4) 本轮 reminder（紧挨本轮 user）

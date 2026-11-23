@@ -1,8 +1,10 @@
 package com.companion.chat.ui
 
+import android.content.Intent
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.DrawerValue
@@ -27,9 +29,13 @@ import com.companion.chat.ui.chat.ChatScreen
 import com.companion.chat.ui.chat.ChatViewModel
 import com.companion.chat.ui.chat.ConversationDrawerContent
 import com.companion.chat.ui.chat.ConversationListViewModel
+import com.companion.chat.ui.daily.DailyTaskScreen
 import com.companion.chat.ui.memory.MemoryScreen
 import com.companion.chat.ui.power.KeepAliveGuideDialog
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.time.LocalDate
 import com.companion.chat.ui.settings.SettingsForm
 import com.companion.chat.ui.settings.SettingsScreen
 import com.companion.chat.ui.theme.CompanionTheme
@@ -38,18 +44,33 @@ class MainActivity : ComponentActivity() {
     // V2.3.6：vm 是 setContent 内 MainScreen 的默认参数局部变量，onResume 拿不到；用 tick 通知页面读结果
     private var resumeTick by mutableIntStateOf(0)
 
+    // 2026-11-23：从通知点进来要定位到指定会话（每日任务 / 主动消息），tap intent 携带会话 id
+    private var openConversationId by mutableStateOf<Long?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        openConversationId = intent?.getLongExtra(EXTRA_CONVERSATION_ID, -1L)?.takeIf { it > 0L }
         setContent {
             CompanionTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    MainScreen(resumeTick = resumeTick)
+                    MainScreen(
+                        resumeTick = resumeTick,
+                        openConversationId = openConversationId,
+                        onConversationHandled = { openConversationId = null }
+                    )
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val id = intent.getLongExtra(EXTRA_CONVERSATION_ID, -1L)
+        if (id > 0L) openConversationId = id
     }
 
     override fun onResume() {
@@ -58,20 +79,66 @@ class MainActivity : ComponentActivity() {
         QuickAccessEntrance.sync(this)
         resumeTick++
     }
+
+    companion object {
+        /** 与 DailyTaskNotifier / AndroidProactiveNotifier 用同一个键。 */
+        private const val EXTRA_CONVERSATION_ID = "extra_conversation_id"
+    }
 }
 
 @Composable
-fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
+fun MainScreen(
+    vm: ChatViewModel = viewModel(),
+    resumeTick: Int = 0,
+    openConversationId: Long? = null,
+    onConversationHandled: () -> Unit = {}
+) {
     val state by vm.uiState.collectAsState()
     val context = LocalContext.current
     val app = context.applicationContext as CompanionApp
 
+    // 2026-11-23：通知点进来 → 打开指定会话（不绑定当前模式，见 ChatViewModel.openConversationFromNotification）
+    // 等首屏默认会话加载完成后再切，避免被 initConversation 覆盖（冷启动点通知的场景）。
+    val initialLoadDone by vm.initialLoadDone.collectAsState()
+    LaunchedEffect(openConversationId, initialLoadDone) {
+        val id = openConversationId ?: return@LaunchedEffect
+        if (!initialLoadDone) return@LaunchedEffect
+        vm.openConversationFromNotification(id)
+        onConversationHandled()
+    }
+
     // V2.3.6：onResume 触发一次读库（vm 在此作用域可见），结果进 state.voicePending 回填输入框
     LaunchedEffect(resumeTick) {
         vm.consumeVoicePendingText()
+        // 2026-11-23：回前台时同步输入栏工具可用性（换模型/服务商后胶囊该置灰就置灰）
+        vm.refreshToolAvailability()
+        // 2026-11-23：联网（智能搜索）每次回到前台默认关，防忘了还开着白烧 token
+        vm.resetWebSearchOnForeground()
+    }
+
+    // 2026-11-22：每天首次回到前台时**主动**定位一次（仅自动定位模式；手填城市直接短路，一次都不调）。
+    // 前台请求只要「仅在使用时允许」权限，不引入后台定位权限（后台请求在 Android 10+ 要「始终允许」，
+    // MIUI 还会反复降级）。刷新到新坐标后立刻强制重拉天气——否则 24h 缓存里还是旧城市的天气。
+    // 全程 runCatching：没权限 / 超时 / 网络失败都不影响界面。
+    LaunchedEffect(resumeTick) {
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val today = LocalDate.now()
+                val refresh = app.locationCache.refreshTodayOnce(today.toEpochDay())
+                val point = refresh.point
+                if (refresh.attempted && point != null) {
+                    app.weatherCache.load(point, today, force = true)
+                }
+            }
+        }
     }
 
     var screen by remember { mutableStateOf("chat") }
+
+    // 2026-11-22：系统返回键（手势/实体）在子页面（设置 / 记忆）时，先回到对话页，
+    // 而不是直接 finish Activity 退到桌面。子页面是同一 Activity 内的 state 切换，
+    // 不接管的话系统返回默认会退出到桌面（用户实测反馈）。
+    BackHandler(enabled = screen != "chat") { screen = "chat" }
 
     // 任务 6.2 / 7.1：首次启动弹一次「保活引导」（白名单 / 自启动 / 后台限制）
     var keepAliveGuide by remember { mutableStateOf<KeepAliveStatus?>(null) }
@@ -103,6 +170,10 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
     }
 
     when (screen) {
+        "daily_tasks" -> {
+            DailyTaskScreen(onBack = { screen = "chat" })
+        }
+
         "memory" -> {
             MemoryScreen(onBack = { screen = "chat" })
         }
@@ -119,6 +190,7 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
                     visionModel = c.visionModel,
                     persona = app.configRepository.getPersona(),
                     contextWindow = c.contextWindow,
+                    // DeepSeek 新 API 相关开关（必须与 ConfigRepository/ApiConfig 双向映射，否则保存会被默认值覆盖）
                     thinkingEnabled = c.thinkingEnabled,
                     deepSeekTtsEnabled = c.deepSeekTtsEnabled,
                     ttsVoice = c.ttsVoice,
@@ -141,6 +213,8 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
                     autoTitleEnabled = c.autoTitleEnabled,
                     jsonModeDefault = c.jsonModeDefault,
                     deepRecallEnabled = app.configRepository.getDeepRecallEnabled(),
+                    // 2026-11-22：对话模式（陪聊 / 正常），默认陪聊
+                    chatMode = app.configRepository.getChatMode(),
                     environmentEnabled = env.environmentEnabled,
                     lateNightEnabled = env.lateNightEnabled,
                     lateNightHour = env.lateNightHour,
@@ -194,7 +268,7 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
                         model = form.model,
                         contextWindow = form.contextWindow,
                         visionModel = form.visionModel,
-                        thinkingEnabled = form.thinkingEnabled,
+                        thinkingEnabled = app.configRepository.getThinkingEnabled(),
                         deepSeekTtsEnabled = form.deepSeekTtsEnabled,
                         ttsVoice = form.ttsVoice,
                         latestReminderEnabled = form.latestReminderEnabled,
@@ -234,8 +308,14 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
                         tempDropThreshold = form.tempDropThreshold
                     )
                 )
-                // V2.1.6 容器接线：手动城市已由 CityGeocoder.resolve() 直接落库（Hit 时），
-                // 无需在此额外写；若后续改为「保存时统一提交」，把 locationCache.setManualCity 放这里。
+                // V2.1.6 容器接线：手动城市由 CityGeocoder.resolve() 直接落库（Hit 时写、输入清空时删），
+                // 设置页保存时不需要再写一次。
+                // 2026-11-22：对话模式。保存后立刻让聊天页切到该模式自己的会话——
+                // 两种模式的历史必须物理隔离，不能靠"下次启动才生效"。
+                app.configRepository.setChatMode(form.chatMode)
+                vm.syncChatMode()
+                // 2026-11-23：换模型/服务商后立刻重算胶囊可用性（置灰规则），不必等重启
+                vm.refreshToolAvailability()
             }
             SettingsScreen(
                 initial = initial,
@@ -290,8 +370,12 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
         else -> {
             val drawerState = rememberDrawerState(DrawerValue.Closed)
             val scope = rememberCoroutineScope()
+            // 2026-11-22：历史会话抽屉（"历史会话页面"）打开时，系统返回先关抽屉，而不是退到桌面。
+            BackHandler(enabled = drawerState.isOpen) { scope.launch { drawerState.close() } }
             val convListVm: ConversationListViewModel = viewModel()
             val summaries by convListVm.summaries.collectAsState()
+            // 2026-11-23：输入栏工具状态（深度思考 / 智能搜索 / 正在搜索）
+            val tool by vm.toolState.collectAsState()
             // V2.3.5：STT 开关。这里没有 SettingsForm 作用域（form 只在 "settings" 分支里），
             // 所以现读一次 pref；从设置页保存回来时本分支会整块重进组合，remember 自然重读。
             val chatSttEnabled = remember { app.configRepository.getSttEnabled() }
@@ -341,6 +425,7 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
                     },
                     onNewChatClick = { vm.newChat() },
                     onMemoryClick = { screen = "memory" },
+                    onDailyTasksClick = { screen = "daily_tasks" },
                     onOpenDrawer = { scope.launch { drawerState.open() } },
                     // V2.3.4：语音输入在 ChatScreen 内部（长按录音 → 松手识别），
                     // onVoiceClick 仅作为 sttManager 缺失时的兜底入口，这里不再放逻辑
@@ -361,7 +446,15 @@ fun MainScreen(vm: ChatViewModel = viewModel(), resumeTick: Int = 0) {
                     // 消息操作：流式中禁用；撤回=截断到这条；重新生成=重问最后一条
                     isStreaming = state.isStreaming,
                     onTruncateFrom = { id -> vm.truncateFrom(id) },
-                    onRegenerate = { vm.regenerateLast() }
+                    onRegenerate = { vm.regenerateLast() },
+                    // 2026-11-23：输入栏工具胶囊 + 「正在搜索…」
+                    thinkingEnabled = tool.thinkingEnabled,
+                    thinkingAvailable = tool.thinkingAvailable,
+                    onThinkingToggle = { vm.setThinkingEnabled(!tool.thinkingEnabled) },
+                    webSearchEnabled = tool.webSearchEnabled,
+                    webSearchAvailable = tool.webSearchAvailable,
+                    onWebSearchToggle = { vm.setWebSearchEnabled(!tool.webSearchEnabled) },
+                    searching = tool.searching
                 )
             }
         }

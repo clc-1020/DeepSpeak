@@ -2483,3 +2483,267 @@ emotion_state = {"his":{"mood":"happy","intensity":0.7},
 - 手动加记忆（`MemoryViewModel.addShort/addLong`）改走 `MemoryDeduplicator.upsertShort/upsertLong`（算向量 + 去重），不再裸插。
 - `MemoryDeduplicator.consolidatePlainLong()`：进聊天页、embedding 就绪后一次性整理**历史**普通长期记忆（合并重复 + 给旧记录补向量），幂等、只动 `intensity<=0`、不碰情绪记忆。
 - 深挖类改动后仍要**拉库核真实余弦**再定阈值——拍脑袋定 0.85/0.80 都不如实测分数可靠。
+
+---
+
+## 1.10.3（2026-11-22）Android 通知是「两层开关」：App 级 ≠ 渠道级；设置页分组折叠
+
+### 坑（真机踩到）
+用户从通知栏把「快捷入口」常驻通知划掉/关闭后：App 里开关还显示开着、"通知权限"还显示（已开启），但通知栏里没有通知。
+
+### 结论
+- **`NotificationManagerCompat.areNotificationsEnabled()` 只反映 App 级总开关**。MIUI/HyperOS 从通知栏「关闭」默认只关**当前渠道**（`NotificationChannel.getImportance()` 变成 `IMPORTANCE_NONE`），App 级仍 `allow`，所以它照样返回 `true`——这就是"显示已开启却发不出"的根因。
+- 判断"通知真的能不能弹"必须 **App 级 && 渠道级**：见 `SystemPermissions.notificationsDeliverable(channelId)` / `channelEnabled(channelId)`。常驻入口启停（`QuickAccessEntrance.sync`、`QuickAccessService.onStartCommand`）都改用它，**别再回到只看 `areNotificationsEnabled()`**。
+- **权限状态不能只在进页面读一次**：从系统设置/通知栏返回要重读。现做法：设置页 `ON_RESUME` + 监听 `ACTION_APP_BLOCK_STATE_CHANGED` / `ACTION_NOTIFICATION_CHANNEL_BLOCK_STATE_CHANGED`（API 28+，低版本只有 `ON_RESUME` 兜底）。
+- 渠道 id 在 `SystemPermissions` 里用字面量 `QUICK_ACCESS_CHANNEL = "quick_access"`（与 `QuickAccessNotificationSpec.CHANNEL_ID` 一致），避免 data→service 反向依赖。
+
+### 设置页分组折叠
+- 通用组件 `CollapsibleSection`（`ui/settings/SettingsScreen.kt`）：`rememberSaveable(title)` 记展开态，收起时显示一行状态摘要，**刻意不做失焦自动收起**（内部有 OutlinedTextField，离开组合会丢光标与内部滚动）。
+- 以后新加设置项归到现有 8 组（模型与服务商 / 语音 / 通知与快捷入口 / 主动消息 / 环境感知 / 人设 / 系统权限与保活 / 高级·调试）里的一组，别又平铺回主页面。
+
+### 追加（同版本）：常驻通知别用前台服务——MIUI 会直接过滤
+- 症状：开「通知栏常驻快捷入口」后通知栏里根本没这条；但 `dumpsys activity services` 里 `QuickAccessService` 是 `isForeground=true`、`foregroundNoti` 也在。
+- 真机 logcat 铁证：`NotificationFilterController: filter out ongoing notif: 0|com.companion.chat|2147483647`——**MIUI/HyperOS 把 FGS 的 ongoing 常驻通知从通知栏丢弃**（服务照跑、通知看不到）。
+- 结论：这种"只是常驻一条通知"的功能**不要用前台服务**。改用普通通知（`setOngoing(false)`、非 FGS），见 `QuickAccessNotifier`。普通通知进程被杀后仍由系统保留，回前台 `QuickAccessEntrance.sync` 再贴一次即可保持。
+- 排查手法（真机）：`adb shell dumpsys notification --noredact | grep <包名>` 看有没有 NotificationRecord；没有就是被过滤/没发；再看 `adb logcat | grep NotificationFilterController` 确认是不是 MIUI 丢的。
+
+---
+
+## 1.10.5（2026-11-22）定位刷新策略：后台没有定位权限，别在后台请求位置
+
+### 坑一（真 bug，用户可感）：后台拿不到坐标，把新鲜天气缓存一起丢了
+- 现场：整点环境检查里 `locationCache.current()` → 后台读位置被系统拒 → `point == null` → `WeatherCache.load()` 第一行 `if (point == null) return EMPTY` **排在查缓存之前** → 哪怕缓存里就是今天的新鲜天气也被这行丢掉。
+- 表现：**降水 / 降温 / 高温三个天气钩子在自动定位模式下一次都不触发**，只剩熬夜、饭点这些纯时间钩子；而发送路径走 `peek()`（不判坐标）所以聊天注记里的天气又是好的 —— 两种现象并存，极难归因。
+- 修法：`load()` 改成**缓存优先**（`!force && 缓存新鲜` → 直接返回，根本不需要坐标），之后才判 `point == null`。**这个顺序别再调回去。**
+- 回归用例：`WeatherCacheTest.fresh_cache_is_used_even_without_a_coordinate`。
+
+### 坑二：Android 10+ 后台请求定位要「始终允许」，本 App 刻意不申请
+- 真机取证：`adb shell cmd appops get com.companion.chat android:coarse_location` → `COARSE_LOCATION: foreground`。
+- 含义：只有「仅使用 App 时允许」。**整点闹钟 / WorkManager 里请求定位在 Android 10+ 属于后台访问，会被系统拒**（返回 null 或抛 `SecurityException`）。
+- 决策：**后台一律不请求定位**，也不加 `ACCESS_BACKGROUND_LOCATION`。理由：Android 11+ 要两步引导（先「仅使用中」再「始终允许」），MIUI/HyperOS 还会周期性把「始终允许」降级回「仅使用时」——和通知渠道那次是同一类反复坑，收益（一天一次位置更新）不值。
+
+### 方案：每天首次回到前台主动刷新一次（`LocationCache.refreshTodayOnce`）
+- 挂在 `MainScreen` 的 `LaunchedEffect(resumeTick)`（由 `onResume` 驱动），`Dispatchers.IO`，外层 `runCatching`。
+- 规则：手动城市 → **一次都不调**（`attempted = false` 直接返回，硬承诺不变）；当天已刷过 → 跳过；否则先主动要一次 `NETWORK`（最省电、室内可用、城市级够），拿不到退回被动 `KnownLocationPick`（NETWORK → GPS 历史位置）。
+- 兜底：`withTimeoutOrNull(5s)`；超时会同时取消系统侧请求，不留监听。
+- **失败也记账**（用户拍板）：失败基本是权限 / provider 问题，重试没意义，当天不再空跑。
+- 刷新到新坐标后立刻 `weatherCache.load(point, today, force = true)` 强制重拉——否则 24h 缓存里还是旧城市的天气。`force` 失败返回 EMPTY 且**不覆盖旧缓存**（宁可这小时不判天气）。
+- 并发：`LocationCache` 内 `Mutex` 串行化，防 `onResume` 与 `ViewModel init` 同时进来各刷一次。
+- **别把「每天刷新」塞进 `current()`**：`current()` 会被后台（整点检查、送达 Worker）调用，而后台不许请求定位。前台入口只能是 `refreshTodayOnce`。
+- `LocationPort.currentOnce(provider, timeoutMs)` 是这次新加的主动接口，**默认实现退化为 `lastKnown`**（既有假实现/测试无需改）。
+
+### 排查手法
+- 现在是不是手动城市：`app_state.manual_city_name` 非空 → 定位完全不参与（`current()` 走 Manual 分支直接返回存好的坐标）。
+- 后台到底有没有定位权限：`adb shell cmd appops get <包名> android:coarse_location`，`foreground` = 只有「仅使用时」。
+- `app_state.location_refreshed_date` 这个键存在才说明「每天首次刷新」真的跑过；不存在 = 从没跑过（本次改动前是死代码）。
+
+---
+
+## 1.10.6（2026-11-22）定位相关的死代码清理 + 整点检查不再白调定位
+
+### 清理（都验证过「生产零调用」）
+- **`LocationCache.setManualCity` / `clearManualCity` 已删**。手动城市从 V2.1.6 起由 `CityGeocoder.resolve()` 自己写 / 删 `app_state` 三个键（Hit 时写、输入清空时删），`MainActivity` 只注入 `cityGeocoder`；这两个方法唯一用户是 `LocationCacheTest`。**手动城市的写入方只能有一个**，否则改一处忘另一处，回显和实际取值会分叉。
+- **`LocatedCity.Manual.name` 已删**。生产代码从不读它——设置页回显走 `LocationCache.manualCityName()`（另读一次键）。删掉后 `LocatedCity` 抽象出 `val point: GeoPoint?`，`ChatViewModel` / `EnvironmentHookService` 里那两段**两边分支完全相同**的 `when` 一并消失，现在统一写 `locationCache.current().point`。
+- **`SettingsScreen` 的 `cityGeocoder` / `locationCache` 从可空改必填**。`MainActivity` 恒传，原来「未注入 → 输入框 disabled + 红字『城市搜索待接线』」的分支永不成立（那行红字从上线起就没显示过）。以后新增注入类参数**别再用 `? = null` 兜底**——除非真的有第二条装配路径。
+
+### 变更：整点检查改成「缓存优先，不碰定位」
+- 之前 `EnvironmentHookService.weatherBundle()` 每次先 `locationCache.current()` 再查天气。缓存新鲜的 23/24 小时里，这次读取**既拿不到结果**（后台无定位权限）**又完全用不上**（`load()` 直接命中缓存返回）。一天白跑 23 次。
+- 新增 `WeatherCache.peekBundle(today)`：只读缓存、不联网、不需要坐标，返回 today + yesterday（降温规则要昨天）。`weatherBundle()` 改成：先 `peekBundle`，有今天数据就直接返回；只有缺失/过期才取坐标 + `load()`。`peek()`（发送路径）复用它，不再各写一份判空。
+- 教训：**任何「先取资源 A，A 只用于可能用不上的 B」的写法都要问一句——B 命中缓存时 A 是不是白拿**。这类白跑在后台场景直接等于无效调用 + 耗电。
+
+### 测试
+- 新增 `WeatherCacheTest` 3 条（`peekBundle` 新鲜/缺失/过期）、`EnvironmentHookServiceTest` 1 条（缓存新鲜时 `port.calls` 为空 → 证明一次定位都没读）；删掉 1 条只测死代码的 `set_and_clear_manual_city_round_trip`。基线 1109 → **1112**。
+
+---
+
+## 1.10.7（2026-11-22）自动定位也要能报城市名：注记第 3 段补「地点」
+
+### 缺口
+`latest_reminder` 第 3 段（`<date>,<weekday>,<location>,<platform>,<language>`）只填**手填城市名**（`ChatViewModel` 里 `location = manualCityName() ?: ""`）。自动定位模式下手填为空 → 整段空了：模型能凭天气段答「今天要带伞」，却答不出「你在哪座城市」，措辞只能含糊。用户一直手填城市，所以这个问题从来没暴露。
+
+### 选型：用系统 `Geocoder`，不引第三方反查接口
+- Open-Meteo 的 geocoding **只能名字→坐标，没有坐标→名字**，所以要反查就得引新服务（Nominatim 要求 UA、BigDataCloud 免 key…），等于把坐标额外发给一个新厂商。
+- 系统 `Geocoder` 更划算：`Geocoder(context, Locale.SIMPLIFIED_CHINESE)` 直接给中文规范名（「佛山市」，与手动城市走的 Open-Meteo `language=zh` 风格一致），**不需要新权限**（Geocoder 不需要定位权限，联网在服务商那侧），也不新增域名。
+- 代价：依赖设备有 GeocodeProvider。GMS 在就基本能用；精简 ROM 可能 `isPresent()==false` 或抛 `IOException("Service not Available")`。**两种都当失败**（返回 null），第 3 段保持空 —— 不比不做更差。
+
+### 时序（关键，别挪）
+- 反查只在 `LocationCache.refreshTodayOnce` 成功拿到坐标后做**一次**（即每天首次回前台），结果写 `app_state`：`auto_city_name` / `auto_city_lat` / `auto_city_lon`。
+- 发送路径只读 `displayCityName()`（手填优先 → 反查结果 → null），**零联网**。把反查放发送路径 = 1.1.0 那个「拉数据挡住发送、消息半天不上屏」的坑重演（当时 `weather_cache_at` 与消息时间戳只差 2ms 就是证据）。
+- `LocationCache` 的第三个构造参数 `cityNames: CityNamePort? = null`：**null = 不反查**，既有单测与任何没装配它的调用方自动退回改动前行为。
+
+### 注意
+- `auto_city_name` **没有过期判断**（点名可能对应几天前的坐标）。刻意如此：每天首次刷新会连带重查；中间用旧名字报天气，比第 3 段空着有用。`auto_city_lat/lon` 只用于排查「名字和坐标对不上」，不参与判定。
+- 手动城市模式下 `refreshTodayOnce` 早退 → 反查不跑，`auto_city_*` 可能停在很久以前；清掉手动城市后会先用旧名字，下一次回前台才更新。可接受。
+- 设置页「手动城市」区多一句「已识别：佛山市」的回显，来自 `LocationCache.autoCityName()`。
+
+---
+
+## 1.10.8（2026-11-22）陪聊 / 正常双模式：为什么必须"物理隔离会话"
+
+### 需求
+能在「陪聊模式」和「正常模式」之间切换。正常模式下不注入人设 / 能力 / 记忆 / 情绪 / 关系，只当普通问答助手。默认陪聊。
+
+### 关键结论：只关 system 不够，必须换会话
+system 可以整段不组装，但**历史消息是 user/assistant 的正文**，照样进上下文。同一个会话里前面全是「宝宝想你」，正常模式下它会顺着那个语气答技术问题——它没收到人设，但它看到了自己以前的语气。
+
+所以两种模式**各绑一个会话**：`app_state.companion_conversation_id` / `normal_conversation_id`。
+`ChatViewModel.loadConversationIntoUi()` 顺手把「当前模式 ↔ 这个会话」写回绑定键，切走再切回能回到原位。
+
+老用户升级时没有绑定键 → 陪聊模式走「最近一个有消息的、且**不是**正常模式那个」的会话兜底，**不能凭空多出一个空对话**（否则会让人以为历史丢了，这个坑在 1.8 的 `initConversation` 已经踩过一次）。
+
+### 注入侧（`ContextBuilder`）
+`build(..., mode: ChatMode = COMPANION)`。`NORMAL` 分支只发 `历史 + 本轮 reminder + 本轮 user`：
+- 不组装稳定前缀（人设 / `CAPABILITIES` / 关系定位 / 长期记忆摘要）
+- 不注入情绪块、记忆块
+- 连记忆查询、情绪读取、关系阶段读取都不执行（不是"查了不用"，是压根不查）
+
+### 注记（`UserMetaMarker`）
+正常模式用 `buildNormal()` → **只有两段** `日期,星期`。地点 / 平台 / 语言 / 天气全是陪伴语境。
+注意：陪聊那套是**恒定 5 段**（多出第 6 段会被服务端 400 拒，V2.1.8 现场教训）；正常模式是**少于** 5 段，不涉及那个上限。
+
+### 回写侧（全停，用户拍板）
+正常模式下这些一律不做：
+1. `last_interaction` 不写 —— 否则问两个技术问题就把主动消息的「冷却 2h」闸门顶掉
+2. `reminderService.scheduleFromText` 不跑 —— 「明天九点开会」是陈述，不是叫我排钟
+3. 记忆抽取 / 容量淘汰不跑 —— 问答内容不该进长期记忆
+4. 情绪判定（每 5 轮）不跑 —— 技术问答判不出"她今天低落吗"
+5. 追问任务抽取不跑 —— 别把技术问题变成"明天来催你"
+6. 回复末尾不加颜文字
+
+### 其它
+- 模式存 `ConfigRepository`（`chat_mode` = `companion` / `normal`，缺失或脏数据回落 `companion`），因为它是一项设置；"哪个会话属于该模式"是运行状态，放 `app_state`。
+- 切换即时生效：设置页保存 → `configRepository.setChatMode()` → `vm.syncChatMode()` → 切会话。不要做成"下次启动才生效"。
+- 设置页位置是用户指定的：「她的状态」卡片下方、「模型与服务商」上方，**不放进折叠组**（切模式是即时意图，藏起来找不到）。
+- 前缀缓存：切模式会让那轮 system 整段变，前缀必然 miss 一次；切回来又 miss 一次。这是切换成本，不是 bug。
+
+### 追加（1.10.9，同日）：模式说明只显示一句会误读
+- 设置页原来只显示**当前模式**的说明。开关标签是「正常模式（只当问答助手）」、默认关着（= 陪聊），下面却写着「她有人设、记忆、情绪和关系」——读起来像「关掉才有她的人设」，实际是「关掉就是陪聊」。
+- 改法：**两个模式的两句话同时列出**，当前模式那句用 `onSurface`、另一句用 `onSurfaceVariant`。文案也压短成一句区别：
+  - 陪聊模式：有人设和记忆，会看情绪和关系，也会主动找你。
+  - 正常模式：只当问答助手，不带人设·记忆·情绪·关系，也不记这里说的话。
+- 教训：**布尔开关 + 单向文案**是误读高发区。要么写两行对照，要么让标签本身自带否定含义（"关闭陪聊功能"），别指望用户把开关方向和文案方向对齐。
+
+### 追加（1.10.10，同日）：`latest_reminder` 是固定 5 段**且除第 3 段外都不能空**
+- 现象：切到正常模式后发消息，直接 `ChatApiClient: 流式请求失败：请求失败：HTTP 400`。
+- 三次真机迭代才定位到（记下来，别再试）：
+  1. **2 段**（`2026-11-22,星期六`）→ 400（空会话 `apiMsgs=2` 也失败，排除"历史里有坏注记"）
+  2. **5 段但 2/3/4 段全空**（`2026-11-22,星期六,,,`）→ **仍然 400**
+  3. **5 段、第 3 段空、第 4/5 段填中性值**（`2026-11-22,星期六,,App,中文`）→ ✅ 通过
+- 结论（契约事实）：
+  - 段数必须**恒为 5**（1.0 已踩过"多出第 6 段"）
+  - **第 3 段（地点·天气）可以为空**（陪聊模式没有城市时一直是空的，一直正常）
+  - **第 4/5 段（平台·语言）不能为空** → 正常模式也必须填 `App` / `中文`
+- `UserMetaMarker.buildNormal()` 最终格式：`日期,星期,,App,中文`。正常模式依然不带地点、不带天气。
+- **教训（比这个 bug 本身重要）**：对一个"服务端按固定形状解析"的字段，**任何方向的形状变化都要真机验**。第一次的单测还专门断言"就是 2 段"、全绿，照样线上 400 —— **测试断言的是我的实现，不是服务端的契约**。中间那版"5 段但空字段"同理，单测也绿。
+
+---
+
+## 1.11.0（2026-11-23）输入栏对齐 DeepSeek 官方 + 联网工具 + 引用落库
+
+### 需求与拍板
+- 输入栏做成官方同款：两颗胶囊「深度思考」「智能搜索」；**发送键只在点输入框聚焦后出现**；语音**按下即录、松手直发**。
+- 用户拍板：上划取消保留；识别失败只提示不发送；通知栏语音入口**维持"只回填不发送"**；引用**存进聊天记录**（灰色小字、默认折叠）；智能搜索**不记住**（每次默认关）；换别的模型胶囊**变灰点不开**。
+
+### 关键事实：官方 API 是能联网的（旧认知作废）
+- 2026-11-13 DeepSeek 发布「全家桶应用 API」，联网搜索以**服务端工具** `deepseek_web_search` 形式开放，Chat Completions 也支持。
+- 请求里声明 `tools: [{"type":"deepseek_web_search"}]` 即可，**客户端不执行任何工具**；搜索/抓取都在服务端。
+- **两个硬约束**：① 只能用 `deepseek-flash`；② **不能和 `title` 同传**（400）。所以 `ChatApiClient` 在联网轮次强制丢 title。
+- 曾经以为"官方 key 没有联网搜索"，是**旧信息**，已纠正（见 CHANGELOG 1.10.x 之前那条讨论）。
+
+### 为什么联网开关只在 flash 可用，其它情况置灰
+- 服务端只认 `deepseek-flash` 的联网工具，别的模型/服务商传了就 400。
+- UI 层：`chatWebSearchAvailable = isDeepSeekCompatible(providerId, baseUrl) && model == "deepseek-flash"`；不满足就 `enabled=false`（变灰，不是隐藏——用户要看得见功能存在）。
+- API 层**再判一次**（防御性重复）：即使 UI 漏判也不会把工具发给不认识它的端点。
+
+### 数据库 v9：`messages.citations`
+- 显式 `MIGRATION_8_9`：`ALTER TABLE messages ADD COLUMN citations TEXT`。**禁破坏性迁移**的约定不变。
+- 存 JSON 字符串而不是建表：引用是整条回复的附属品，没有独立生命周期、不查询/不去重/不更新；建表会让 Migration + DAO 复杂度翻倍。
+- `CitationCodec` 容错解码：坏 JSON / 老数据 / 空 url 一律当"没引用"，绝不让一条脏记录炸掉整条消息。
+
+### 语音交互（按下即录、松手直发）
+- 去掉 `longPressTimeout` 等待：`awaitFirstDown` 后立刻请求权限 → `controller.start()` → 跟踪位移（上划取消）→ 松手 `finish()`。
+- `VoiceInputController.onResult` 从「回填输入框」改成「直接调 `onSendMessage(text, emptyList(), ...)`」——**不携带已选图片**（语音是独立的纯文本消息）。
+- 通知栏语音快捷入口**不接这条链路**：它仍然回填输入框、绝不自动发送（用户明确要求）。
+
+### 深度思考状态搬家的坑
+- 开关从设置页搬走后，`SettingsForm` 删了 `thinkingEnabled` 字段。但 `MainActivity.persist()` 里 `ApiConfig(thinkingEnabled = ...)` **必须写 `configRepository.getThinkingEnabled()`**，不能写 `false` —— 否则用户去设置页保存一次就把胶囊刚打开的思考关掉了。
+
+### 追加（1.11.2，同日）：键盘可见性 ≠ 输入框聚焦（Compose 真机坑）
+- 现象：点输入框 → 发送键出现；按**系统返回键**收起键盘 → 发送键还在，语音键不回来。
+- 根因：Compose 里收起键盘时 **TextField 不会失去焦点**（`isFocused` 恒 true）。"聚焦"不是"键盘开着"的可靠信号。
+- ⚠️ 本条曾建议改用 **IME insets**（`WindowInsets.ime.getBottom(...) > 0`）—— **在本机（MIUI + 传统窗口 + compose-bom 2023.10.01）实测 `WindowInsets.ime` 恒为 0、完全没信号，这条路走不通**（1.11.x 因此整体回退到 1.10.10）。最终可行方案见文末「1.11.0 重做版」。
+
+### 追加（2026-11-23）：降级安装 APK 会因 Room「无降级迁移」直接崩，抢救步骤
+- 触发：装回旧版本（如 v9 库 + versionCode 79 的代码）→ `IllegalStateException: A migration from 9 to 8 was required but not found`，App 起不来。
+- 项目规则禁 `fallbackToDestructiveMigration`，**清数据等于删光 API Key / 人设 / 记忆**，绝不走这条路。
+- 抢救四步（root 真机）：
+  1. `am force-stop` 停 App → root `cat` 拉出 `companion.db`（此时通常没有 -wal/-shm，因为进程已停、SQLite 已 checkpoint）。
+  2. 本地 Python（sqlite3 ≥ 3.35 可 DROP COLUMN，否则用「建 _new 表 → INSERT SELECT → DROP → RENAME」四步法）把库**降回旧 schema**，`PRAGMA user_version` 改回旧值。
+  3. **同步改 `room_master_table` 的 identity_hash**（从 `app/schemas/.../<旧版本>.json` 里读）——漏了这步会报 "Room cannot verify the data integrity"，第二次崩。
+  4. 推回设备：`cp` 进 databases/ → `chown u0_a303:u0_a303` + `chmod 660`（属主错了 App 打不开库）→ 删掉 -wal/-shm 残留 → 启动验证。
+- 安装降级 APK 用 `pm install -r -t -d`（`-d` 允许 versionCode 降级，否则 INSTALL_FAILED_VERSION_DOWNGRADE）。
+- 本次实做：messages 表去掉 citations 列、user_version 9→8、hash 换回 8.json 的值，4 条消息完好、integrity ok、App 正常启动。
+
+---
+
+## 1.11.0 重做版（2026-11-23，vc80）—— 输入栏 + 联网搜索 + 引用落库（这次真机路线可行）
+
+> 上文「1.11.0–1.11.3」是已回退的第一次尝试。下面只记**这次重做**跟上次不同的、以及必须记住的结论。
+
+### 输入栏「发送键只点输入框才出现」——最终可行方案（重点）
+- **不要再用「键盘可见性」当信号**：本机 `WindowInsets.ime` 恒为 0；Compose 收键盘时 TextField 也不失焦。两条路都死。
+- **改用「输入框是否被点开（焦点）」+ 主动清焦点**：
+  1. `BasicTextField` 加 `Modifier.onFocusChanged { inputFocused = it.isFocused }`。
+  2. `发送键显示 = inputFocused || 有字`（有字包括通知栏语音填进来的）。这样「没点输入框但已有字」时发送键也会出现在原麦克风位置。
+  3. `BackHandler(enabled = inputFocused) { focusManager.clearFocus(); keyboardController?.hide() }` —— 按返回键时**主动清焦点**收起键盘，发送键退回麦克风（解决上次「收键盘不退回」的核心问题）。
+  4. 消息区空白 `pointerInput { detectTapGestures { focusManager.clearFocus() } }` —— 点空白也退回。
+- 麦克风与发送**共用同一个位子**：`showSend=false → 麦克风(按下即录)`；`showSend=true → 上箭头发送(无字置灰)`。
+
+### 输入栏工具胶囊（深度思考 / 智能搜索）
+- 状态放在 **ViewModel 的独立 `ToolUiState`**（`StateFlow`），**不要塞进 `ChatUiState`**：切会话/新建会话会整体 `ChatUiState(...)` 替换，会把开关重置。
+- `thinkingEnabled` **持久化**（写 `ConfigRepository`，`ApiConfig.thinkingEnabled`）；`webSearchEnabled` **只在内存**（每次进 App 默认关）。
+- 可用性：`isDeepSeekCompatible(providerId, baseUrl) && model == "deepseek-flash"` 才可点，否则两颗一起置灰。`refreshToolAvailability()` 在 init / 回前台 / 设置保存后各调一次。
+- **设置页保存不能把思考写回 false**：`SettingsForm.thinkingEnabled` 字段可留着（无 UI），但 `MainActivity.persist` 里 `ApiConfig(thinkingEnabled = ...)` 必须写 `configRepository.getThinkingEnabled()`。
+- 图标别撞：顶栏记忆是 `Icons.Default.Psychology`（大脑），深度思考用 `Lightbulb`、智能搜索用 `Language`。
+
+### 联网搜索 + 引用
+- 请求：`ChatRequest.tools = [ToolOption("deepseek_web_search")]`；仅 `isDeepSeekCompatible && model=="deepseek-flash"`；且**与 title 互斥**（同传 400）→ 联网轮强制丢 title。
+- 引用解析：`delta.annotations` 用 **`JsonElement` 宽松承载**（不要用强类型 DTO，形状一 mismatch 会连正文 delta 一起丢帧）。`CitationParser.parse` 逐项取 url/title/site_name，空 url 丢弃；ViewModel 按 url 去重累积。
+- 落库：`messages.citations` TEXT 存 JSON（`CitationCodec` 容错：坏 JSON/老数据→空）；`MIGRATION_8_9` 显式加列（可空）。
+- 「正在搜索…」：联网轮开流时 `searching=true`，第一个 Delta 或流结束置 false；UI 在「流式临时气泡(内容空)」里显示。
+
+### 语音（这次与上次不同的关键点）
+- 上次是「松手直发」；**这次按用户要求改成「松手识别 → 回填输入框可编辑」，不自动发送**。
+- 触发从「长按超时」改成「**按下即录**」：`awaitFirstDown` 后不再 `withTimeoutOrNull(longPressTimeout)`，直接开麦。
+- 上划取消 / 识别失败只提示不发送 / 通知栏入口只填不发 —— 维持。
+
+---
+
+## 1.12.0（2026-11-23，vc81）每日任务板块
+
+### 需求与拍板（用户逐条确认）
+- 每条每日任务：固定文本 + 时间（时:分）+ 模式（陪聊 / 对话）+ 语音开关 + 启用；可多条。
+- 到点开「该任务专属会话」→ 把文本当用户消息发 AI → 回复以弹窗通知推送（对话也留存）。
+- **覆盖**：每个任务固定一个会话，**每次成功执行先清空旧消息再写今天这一问一答**（今天覆盖昨天，省 token；用户接受"翻不回更早"）。
+- 陪聊模式**只借人设语气，不写记忆不改情绪**；对话模式干净问答。
+- 到点**照弹、无视 App 勿扰**；语音沿用设置里当前 TTS。
+- 入口：顶栏【菜单】【设置】【日历】。
+
+### 预热：为什么最终"不做"（重要，别重蹈）
+- 用户记得"随机关心那阵做过预热"，但**代码里并没有**这套机制；方案文档 `最终方案.md` 163 行、`完整方案.md` 174 行明写「第一版不提前唤醒预热，到点直接生成+发」。
+- 复查结论：MIUI/HyperOS 上「提前 N 分钟唤醒把状态焐热」**保不住进程**（两分钟间隙会被冻结/清掉，开前台常驻又被 MIUI 过滤通知）；且多一个闹钟 = 多一处"可能被延迟/丢"。
+- 唯一能绕开 MIUI 的变种是「提前预生成 + **把回复落到数据库** + 整点读库秒弹」，但预热闹钟本身在 MIUI 上仍不保证准时、失败还得回落现生成。用户确认：**先走 A（到点现生成），B 留作后续增强**。
+- 现有"预热"只有 `ChatViewModel.prefetchEmbedding()` / `prefetchWeather()`（进聊天页触发，非定时）；每日任务陪聊不写记忆，连本地 embedding 都用不上，真正只差 LLM 网络时延。
+
+### 实现要点 / 坑
+- 复用现有提醒/主动消息的基础设施：`setAlarmClock`（精确、Doze 穿透，本机已验证能响）+ `ReminderAlarmReceiver` + `WakeLock` + WorkManager Worker。
+- `AlarmKind.DAILY_TASK`，requestCode 独立号段 `AlarmCodes.dailyTask = 3_000_000 + id`（避开提醒 id 派生码与环境 999_999）。
+- 接收器 `handleDailyTask` **先续排下一天、再触发 `DailyTaskWorker`**（续命优先：一次生成失败不能让明天的闹钟也没了）。
+- 生成走 `ChatApiClient.callJson`（非流式、thinking 关）；companion 的 `schemaHint` = 人设，normal = 空。
+- **通知点击定位会话时 `loadConversationIntoUi(id, bindToMode=false)`**：否则会把"当前模式的唯一会话"键悄悄改成任务会话，用户下次聊天就跑进任务会话里了。
+- 「覆盖」只在**生成成功后**才 `deleteByConversation` 再写；生成失败（没网/没 Key）保留旧数据，不能因为一次失败把上次内容也毁了。
+- 数据库 v9→v10 新建 `daily_tasks`；迁移 CREATE 语句必须与导出的 `10.json` 完全一致（已核对）。
+- **不占每日主动消息次数**：DailyTaskRunner 直接生成+写库+通知，**不经过** `ProactiveGate`/`PendingMessageQueue`/`ProactiveSendCounter`（每日上限只管自发闲聊/环境/节日）。核对过零耦合。
+- **删除/禁用任务的清理**：删任务要 `cancelTask`（取消定点闹钟）+ `DailyTaskWorker.cancel`（`cancelUniqueWork("daily_task_<id>")` 撤掉已排好但没跑的后台作业）再删行；禁用也撤待跑作业。会话聊天记录保留（删任务 ≠ 删历史）。
+
+

@@ -11,7 +11,7 @@ package com.companion.chat.data.alarm
  *
  * [INSTRUCTION] 是默认值：现有 3 参调用点（用户指令提醒）零改动。
  */
-enum class AlarmKind { INSTRUCTION, FOLLOWUP, TIMEOUT, ENV_CHECK }
+enum class AlarmKind { INSTRUCTION, FOLLOWUP, TIMEOUT, ENV_CHECK, DAILY_TASK }
 
 /**
  * requestCode 分配表（唯一出处，带单测）。任务 3.5
@@ -32,6 +32,12 @@ object AlarmCodes {
 
     /** 超时：`2_000_000 + id`。 */
     fun timeout(reminderId: Long): Int = 2_000_000 + reminderId.toInt()
+
+    /**
+     * 每日任务（2026-11-23）：`3_000_000 + 任务id`。
+     * 用独立号段，绝不与上面三类提醒 id 派生码 / 环境检查 999_999 撞车。
+     */
+    fun dailyTask(taskId: Long): Int = 3_000_000 + taskId.toInt()
 
     /** 三个提醒 code 成套取消，漏一个就留僵尸闹钟。 */
     fun cancelAll(reminderId: Long): List<Int> =

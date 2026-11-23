@@ -50,6 +50,24 @@ class WeatherCache(
 ) {
 
     /**
+     * 只读缓存、**绝不联网、也不需要坐标**，返回完整 bundle（today + yesterday）。
+     *
+     * 2026-11-22 新增。用途：整点环境检查先问缓存——缓存新鲜时规则引擎要的
+     * today/yesterday 都在里面，**完全不必读定位**。此前每次 `recall()` 都会先
+     * `locationCache.current()`，而后台读位置在 Android 10+ 必被拒；缓存新鲜的 23/24 小时
+     * 里那次读取纯属白跑。
+     *
+     * @return 缓存缺失 / 过期（> 24h）/ 解析失败 → [WeatherBundle.EMPTY]
+     */
+    suspend fun peekBundle(today: LocalDate): WeatherBundle {
+        val cachedJson = store.get(EnvironmentKeys.WEATHER_CACHE_JSON) ?: return WeatherBundle.EMPTY
+        val cachedAt = store.get(EnvironmentKeys.WEATHER_CACHE_AT)?.toLongOrNull()
+            ?: return WeatherBundle.EMPTY
+        if (!isFresh(cachedAt)) return WeatherBundle.EMPTY
+        return parse(cachedJson, today)
+    }
+
+    /**
      * **只读缓存、绝不联网**（V2.1.8 发送路径专用）。
      *
      * 为什么单独开一个方法：`load()` 在缓存缺失/过期时**会现场发 HTTP**（天气客户端
@@ -62,12 +80,7 @@ class WeatherCache(
      *
      * @return 今天的新鲜快照；缓存缺失/过期/解析失败 → null
      */
-    suspend fun peek(today: LocalDate): WeatherSnapshot? {
-        val cachedJson = store.get(EnvironmentKeys.WEATHER_CACHE_JSON) ?: return null
-        val cachedAt = store.get(EnvironmentKeys.WEATHER_CACHE_AT)?.toLongOrNull() ?: return null
-        if (!isFresh(cachedAt)) return null
-        return parse(cachedJson, today).today
-    }
+    suspend fun peek(today: LocalDate): WeatherSnapshot? = peekBundle(today).today
 
     /**
      * 失败重试版 [load]（1.9.3.1）：**仅用于后台预热**，绝不用于发送路径。
@@ -99,22 +112,37 @@ class WeatherCache(
     /**
      * 读取天气。
      *
-     * 流程：
-     * 1. 没有坐标 → 直接 EMPTY（不发请求）
-     * 2. 缓存新鲜 → 用缓存解析（**不联网**）
-     * 3. 缓存过期或没有 → 联网；成功则写缓存并解析，失败则 EMPTY
+     * 流程（**顺序是修过的，别调回去**）：
+     * 1. 缓存新鲜且 `force = false` → 用缓存解析（**不联网、连坐标都不需要**）
+     * 2. 没有坐标 → EMPTY（不发请求）
+     * 3. 缓存过期或没有（或 `force = true`）→ 联网；成功则写缓存并解析，失败则 EMPTY
+     *
+     * **为什么缓存必须先于坐标判空**（2026-11-22 修的真 bug）：
+     * 原实现第一步就是 `if (point == null) return EMPTY`。而整点环境检查跑在**后台**，
+     * 手机上只给了「仅在使用 App 时允许」定位权限 → 后台 `getLastKnownLocation` 被系统拒
+     * → point 恒为 null → 就算缓存里有今天的新鲜天气也被这行直接丢掉。
+     * 表现为：**下雨 / 降温 / 高温三个天气钩子在自动定位模式下一次都不触发**，
+     * 只剩熬夜、饭点这些跟位置无关的。而发送路径走 [peek]（不判 point），
+     * 所以聊天注记里的天气看着是好的 —— 极难归因。
      *
      * @param point 当前坐标；null 表示定位失败且没有手动城市
      * @param today 用户本地日期（`LocalDate.now()`），用来在 `daily.time` 里定位今天与昨天
+     * @param force 忽略新鲜缓存强制重拉。**只在「坐标刚变过」时用**（每天首次前台刷新定位之后），
+     *   否则 24h 缓存里还是旧城市的天气。强制重拉失败时返回 [WeatherBundle.EMPTY] 且
+     *   **不覆盖旧缓存**——宁可这小时不判天气，也不拿旧城市的数据冒充新城市。
      */
-    suspend fun load(point: GeoPoint?, today: LocalDate): WeatherBundle {
-        if (point == null) return WeatherBundle.EMPTY
-
+    suspend fun load(
+        point: GeoPoint?,
+        today: LocalDate,
+        force: Boolean = false,
+    ): WeatherBundle {
         val cachedJson = store.get(EnvironmentKeys.WEATHER_CACHE_JSON)
         val cachedAt = store.get(EnvironmentKeys.WEATHER_CACHE_AT)?.toLongOrNull()
-        if (cachedJson != null && cachedAt != null && isFresh(cachedAt)) {
+        if (!force && cachedJson != null && cachedAt != null && isFresh(cachedAt)) {
             return parse(cachedJson, today)
         }
+
+        if (point == null) return WeatherBundle.EMPTY
 
         val result = http.get(EnvironmentUrls.forecastUrl(point, forecastBase))
         if (result !is HttpTextResult.Ok) return WeatherBundle.EMPTY

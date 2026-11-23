@@ -40,6 +40,12 @@ data class TitleOption(val enabled: Boolean = true)
 /** 思考控制：{"type":"enabled"|"disabled"}。deepseek-flash 默认开，陪伴要显式关。 */
 data class ThinkingOption(val type: String)
 
+/**
+ * 服务端工具声明（2026-11-23）。联网搜索：`{"type":"deepseek_web_search"}`。
+ * 客户端**不执行**任何工具，搜索/抓取都在 DeepSeek 服务端完成。
+ */
+data class ToolOption(val type: String)
+
 /** 对话补全请求体（OpenAI 兼容格式 + DeepSeek 新参数）。 */
 data class ChatRequest(
     val model: String,
@@ -54,7 +60,9 @@ data class ChatRequest(
     /** 思考控制，仅 DeepSeek 服务商传。 */
     val thinking: ThinkingOption? = null,
     /** 思考强度，仅 thinking=enabled 时传。 */
-    @SerializedName("reasoning_effort") val reasoningEffort: String? = null
+    @SerializedName("reasoning_effort") val reasoningEffort: String? = null,
+    /** 服务端工具（如联网搜索）。仅 DeepSeek 官方兼容端点 + deepseek-flash 时传。 */
+    val tools: List<ToolOption>? = null
 )
 
 /** 非流式补全响应（callJson 用）。 */

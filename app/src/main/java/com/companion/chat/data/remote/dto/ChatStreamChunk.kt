@@ -1,5 +1,6 @@
 package com.companion.chat.data.remote.dto
 
+import com.google.gson.JsonElement
 import com.google.gson.annotations.SerializedName
 
 /** 流式返回的单帧（`data: {...}` 里的对象）。任务 1.2 */
@@ -23,7 +24,13 @@ data class DeltaDto(
      * 思考内容增量（thinking=enabled 时才有）。当前 UI 只显示正文，这里解析出来避免丢失，
      * 便于将来做「思考过程」展示；不解析也不影响正文流。
      */
-    @SerializedName("reasoning_content") val reasoningContent: String? = null
+    @SerializedName("reasoning_content") val reasoningContent: String? = null,
+    /**
+     * 联网搜索引用（2026-11-23）：`deepseek_web_search` 工具返回的来源注解。
+     * 用 JsonElement 宽松承载——结构由服务端决定，强类型化一旦不匹配会连正文一起丢帧，
+     * 这里交给 CitationParser 逐项取 url/title/site_name。
+     */
+    val annotations: JsonElement? = null
 )
 
 /**

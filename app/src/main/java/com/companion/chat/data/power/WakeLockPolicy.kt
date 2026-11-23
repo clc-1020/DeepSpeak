@@ -25,10 +25,13 @@ object WakeLockPolicy {
     const val TAG_REMINDER = "companion:reminder_alarm"
     const val TAG_TTS = "companion:tts_read"
 
+    /** 每日任务到点生成/送达（2026-11-23）：网络生成 + 入库 + 通知 + 可选语音，用 TIMEOUT_MS 档。 */
+    const val TAG_DAILY = "companion:daily_task"
+
     /** 开机/升级后恢复闹钟（B9）：重启恢复要读 Room + 多次排闹钟，用 Receiver 的 10s 档。 */
     const val TAG_BOOT = "companion:boot_restore"
 
-    val ALL_TAGS = listOf(TAG_CHECK, TAG_DELIVERY, TAG_REMINDER, TAG_TTS, TAG_BOOT)
+    val ALL_TAGS = listOf(TAG_CHECK, TAG_DELIVERY, TAG_REMINDER, TAG_TTS, TAG_DAILY, TAG_BOOT)
 }
 
 /** 策略判定结果（日志 / 设置页诊断用）。 */

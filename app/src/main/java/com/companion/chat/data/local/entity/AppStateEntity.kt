@@ -27,6 +27,11 @@ data class AppStateEntity(
         const val KEY_APP_LAUNCH_COUNT = "app_launch_count" // 累计启动次数（任务 6.2 弹窗时机：≥2 次才弹）
         const val KEY_VOICE_PENDING_TEXT = "voice_pending_text"   // V2.3.6：通知栏语音识别结果，MainActivity 读一次即删
 
+        // ---- 2026-11-22：对话模式 ↔ 会话绑定 ----
+        // 两种模式各用各的会话，历史才隔离得干净（system 关掉也挡不住历史里的语气）。
+        const val KEY_COMPANION_CONVERSATION_ID = "companion_conversation_id"
+        const val KEY_NORMAL_CONVERSATION_ID = "normal_conversation_id"
+
         /**
          * 情绪状态 JSON（2026-11-21 情绪系统 P1）：`{his:{mood,intensity,since}, hers:{emotions,trigger,since}, updated_at}`。
          * **衰减不需要定时任务**：读的时候按 `now - updated_at` 现算。

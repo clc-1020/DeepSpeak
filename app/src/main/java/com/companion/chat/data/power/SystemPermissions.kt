@@ -1,6 +1,7 @@
 package com.companion.chat.data.power
 
 import android.app.AlarmManager
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -20,7 +21,15 @@ import android.util.Log
 data class SystemPermissionStatus(
     val notificationsEnabled: Boolean,
     val exactAlarmAllowed: Boolean,
-    val ignoringBatteryOptimizations: Boolean
+    val ignoringBatteryOptimizations: Boolean,
+    /**
+     * quick_access 通知渠道是否未被用户单独关掉。
+     *
+     * app 级 [notificationsEnabled]（areNotificationsEnabled）只看总开关；MIUI/HyperOS
+     * 从通知栏「关闭」通常只关**渠道**，总开关仍是 allow → 通知发不出来却显示"已开启"。
+     * 所以界面必须单独看渠道 importance 是否为 NONE。默认 true（渠道没建=没被单独禁）。
+     */
+    val quickAccessChannelEnabled: Boolean = true
 ) {
     /** 三项都 OK 才算「完全就绪」。 */
     val allGranted: Boolean
@@ -40,12 +49,32 @@ class SystemPermissions(private val context: Context) {
         exactAlarmAllowed = exactAlarmAllowed(),
         ignoringBatteryOptimizations = runCatching {
             KeepAliveLauncher(context).isIgnoringBatteryOptimizations()
-        }.getOrDefault(false)
+        }.getOrDefault(false),
+        quickAccessChannelEnabled = channelEnabled(QUICK_ACCESS_CHANNEL)
     )
 
     fun notificationsEnabled(): Boolean = runCatching {
         NotificationManagerCompat.from(context).areNotificationsEnabled()
     }.getOrDefault(true)
+
+    /**
+     * 渠道级开关：用户把某个通知渠道关掉时 `getImportance()` 返回 IMPORTANCE_NONE。
+     *
+     * 这是**独立于** App 级 `areNotificationsEnabled()` 的第二层开关。MIUI/HyperOS 从通知栏
+     * 滑动「关闭」通常只关当前渠道，App 级总开关仍是 allow，于是 areNotificationsEnabled()
+     * 返回 true、但通知根本发不出来 —— 这就是「显示已开启却没通知」的根因。
+     * 渠道尚未创建（从未发过通知）时返回 true（视为没被单独禁）。
+     */
+    fun channelEnabled(channelId: String): Boolean = runCatching {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return@runCatching true
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channel = nm.getNotificationChannel(channelId) ?: return@runCatching true
+        channel.importance != NotificationManager.IMPORTANCE_NONE
+    }.getOrDefault(true)
+
+    /** 「通知真的能不能弹出来」：App 级开关 与 指定渠道级开关 同时成立。 */
+    fun notificationsDeliverable(channelId: String): Boolean =
+        notificationsEnabled() && channelEnabled(channelId)
 
     fun exactAlarmAllowed(): Boolean = runCatching {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@runCatching true
@@ -53,7 +82,7 @@ class SystemPermissions(private val context: Context) {
         am.canScheduleExactAlarms()
     }.getOrDefault(true)
 
-    /** 跳本应用的通知设置（Android 8+ 有专门的 app-notification-settings 页）。 */
+    /** 跳本应用的通知设置（Android 8+ 有专门的 app-notification-settings 页，可看到各渠道）。 */
     fun openNotificationSettings(): Boolean = start(
         Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
             .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
@@ -82,11 +111,14 @@ class SystemPermissions(private val context: Context) {
         context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         true
     } catch (e: Exception) {
-        Log.w(TAG, "startActivity 失败: ${e.javaClass.simpleName} (${intent.action})")
+        Log.w(TAG, "startActivity 失败: ${e.javaClass.simpleName} (${intent.action})", e)
         false
     }
 
     private companion object {
         const val TAG = "SystemPermissions"
+
+        /** 与 QuickAccessNotificationSpec.CHANNEL_ID 保持一致（用字面量避免 data→service 反向依赖）。 */
+        const val QUICK_ACCESS_CHANNEL = "quick_access"
     }
 }

@@ -136,7 +136,7 @@ private fun RecordingPanel(
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Text(
-                    text = if (cancel) "松手取消" else "松手发送，上划取消",
+                    text = if (cancel) "松手取消" else "松手上屏，上划取消",
                     color = onColor,
                     fontSize = 14.sp
                 )

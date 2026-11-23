@@ -23,8 +23,10 @@ import com.companion.chat.domain.ContextBuilder
 import com.companion.chat.domain.memory.RecallTriggerDetector
 import com.companion.chat.domain.emotion.EmotionKaomoji
 import com.companion.chat.domain.UserMetaMarker
+import com.companion.chat.domain.chat.ChatMode
+import com.companion.chat.domain.chat.Citation
+import com.companion.chat.domain.chat.CitationCodec
 import com.companion.chat.domain.environment.WeatherSummary
-import com.companion.chat.data.environment.LocatedCity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -72,11 +74,48 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
+    /**
+     * 首屏默认会话是否已加载完成（2026-11-23）。
+     * 供「从通知点进来要定位到指定会话」用：等它 true 后再切，避免被 [initConversation] 的默认会话覆盖。
+     */
+    private val _initialLoadDone = MutableStateFlow(false)
+    val initialLoadDone: StateFlow<Boolean> = _initialLoadDone.asStateFlow()
+
+    /**
+     * 输入栏工具状态（2026-11-23）：深度思考 + 智能搜索（联网）两颗胶囊 + 「正在搜索…」标记。
+     *
+     * 与消息状态 [_uiState] 分开：切会话 / 新建会话会整体替换消息状态，但这两个开关是**用户意图**，
+     * 不应该被会话切换重置。
+     * - [thinkingEnabled] 持久化（老用户的值直接复用，不重置）；变更即写回 ConfigRepository。
+     * - [webSearchEnabled] **不持久化**：每次进 App 默认关，想联网手动点，防白烧 token。
+     * - [thinkingAvailable]/[webSearchAvailable]：只有 DeepSeek 官方兼容端点 + deepseek-flash 才 true。
+     * - [searching]：联网请求已发出、正文还没开始流时置 true，UI 显示「正在搜索…」。
+     */
+    data class ToolUiState(
+        val thinkingEnabled: Boolean = false,
+        val thinkingAvailable: Boolean = false,
+        val webSearchEnabled: Boolean = false,
+        val webSearchAvailable: Boolean = false,
+        val searching: Boolean = false
+    )
+
+    private val _toolState = MutableStateFlow(ToolUiState())
+    val toolState: StateFlow<ToolUiState> = _toolState.asStateFlow()
+
     private var conversationId: Long? = null
+
+    /**
+     * 当前对话模式（2026-11-22）。由 [syncChatMode] 从配置同步，UI 不直接改它。
+     *
+     * 正常模式下：不注入人设/能力/关系/记忆/情绪，不回写记忆/情绪/追问/提醒排钟，
+     * 注记只发「日期,星期」两段。
+     */
+    private var chatMode: ChatMode = ChatMode.COMPANION
 
     init {
         prefetchWeather() // V2.1.8：进聊天页先后台拉一次天气，发消息时直接读缓存
         prefetchEmbedding() // 2026-11-21：预热本地向量模型，避免首轮记忆召回现加载（1~2s 卡首字）
+        refreshToolAvailability() // 2026-11-23：同步输入栏胶囊的可用性与思考开关回显
         viewModelScope.launch { withContext(Dispatchers.IO) { initConversation() } }
     }
 
@@ -254,12 +293,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** 把某会话的历史加载到 UI 状态（switchTo / deleteConversation 复用）。任务 1.8 */
-    private suspend fun loadConversationIntoUi(id: Long) {
+    private suspend fun loadConversationIntoUi(id: Long, bindToMode: Boolean = true) {
         val history = messageDao.getByConversation(id)
         val lastAssistantUsage = history.lastOrNull {
             it.role == MessageRole.ASSISTANT && it.tokPerSec != null
         }
         conversationId = id
+        // 2026-11-22：顺手把「当前模式 ↔ 这个会话」记下来，下次切回该模式直接回到这里
+        // 2026-11-23：从每日任务通知点进来查看时 bindToMode=false —— 别把该模式的主会话悄悄换成任务会话
+        if (bindToMode) {
+            runCatching { appStateDao.put(AppStateEntity(modeKey(chatMode), id.toString())) }
+        }
         _uiState.value = ChatUiState(
             messages = history.map(::toUi),
             tokPerSec = lastAssistantUsage?.tokPerSec,
@@ -267,6 +311,77 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             contextUsage = lastAssistantUsage?.contextUsage,
             currentConversationId = id
         )
+    }
+
+    /**
+     * 从通知点进来查看某个会话（每日任务 / 主动消息共用）。
+     * **不绑定到当前模式**（bindToMode=false），否则会把「陪聊/正常」的主会话替换成这条通知的会话。
+     */
+    fun openConversationFromNotification(id: Long) {
+        if (_uiState.value.isStreaming) return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                if (conversationDao.getById(id) != null) {
+                    loadConversationIntoUi(id, bindToMode = false)
+                }
+            }
+        }
+    }
+
+    /**
+     * 从配置同步对话模式（2026-11-22）。设置页保存后 / 每次回前台调一次。
+     *
+     * 模式变了就把当前会话记到旧模式名下，再切到新模式自己的会话 —— 两种模式的历史
+     * 必须物理隔离，否则正常模式会带着陪聊的语气答技术问题（历史是正文，关不掉）。
+     */
+    fun syncChatMode() {
+        if (_uiState.value.isStreaming) return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val target = runCatching { configRepository.getChatMode() }
+                    .getOrDefault(ChatMode.COMPANION)
+                if (target == chatMode) return@withContext
+                conversationId?.let {
+                    runCatching { appStateDao.put(AppStateEntity(modeKey(chatMode), it.toString())) }
+                }
+                chatMode = target
+                loadConversationIntoUi(conversationFor(target))
+            }
+        }
+    }
+
+    /** 某个模式的会话绑定键（`app_state`）。 */
+    private fun modeKey(mode: ChatMode): String = when (mode) {
+        ChatMode.COMPANION -> AppStateEntity.KEY_COMPANION_CONVERSATION_ID
+        ChatMode.NORMAL -> AppStateEntity.KEY_NORMAL_CONVERSATION_ID
+    }
+
+    /**
+     * 取该模式该用的会话 id，没有就建一个。
+     *
+     * 陪聊模式的"没有"分支特意复用「最近一个有消息的、且不是正常模式那个」的会话：
+     * 老用户升级后没有绑定键，不能凭空多出一个空对话让人以为历史丢了。
+     */
+    private suspend fun conversationFor(mode: ChatMode): Long {
+        val key = modeKey(mode)
+        val saved = appStateDao.get(key)?.toLongOrNull()
+        if (saved != null && conversationDao.getById(saved) != null) return saved
+
+        val id = if (mode == ChatMode.NORMAL) {
+            conversationDao.insert(
+                ConversationEntity(title = NORMAL_CONVERSATION_TITLE, createTime = now(), lastMessageTime = now())
+            )
+        } else {
+            val normalId = appStateDao.get(AppStateEntity.KEY_NORMAL_CONVERSATION_ID)?.toLongOrNull()
+            val candidates = conversationDao.getAll().filter { it.id != normalId }
+            val existing = candidates.firstOrNull { messageDao.countByConversation(it.id) > 0 }
+                ?: candidates.firstOrNull()
+            existing?.id ?: conversationDao.insert(
+                ConversationEntity(title = DEFAULT_TITLE, createTime = now(), lastMessageTime = now())
+            )
+        }
+        runCatching { appStateDao.put(AppStateEntity(key, id.toString())) }
+        return id
     }
 
     fun clearError() {
@@ -291,28 +406,69 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _uiState.update { it.copy(voicePending = null) }
     }
 
+    // ---------- 输入栏工具：深度思考 / 智能搜索（2026-11-23） ----------
+
+    /**
+     * 同步工具可用性 + 深度思考回显。
+     *
+     * 在 ViewModel 初始化、以及从设置页返回 / 每次回前台（MainActivity）时调用：
+     * - 只有「DeepSeek 官方兼容端点 + deepseek-flash」两颗胶囊才可点，否则一起置灰、且强制关掉。
+     * - 深度思考从配置读（持久化）；不可用时显示为关。
+     * - 联网不持久化：可用时保留当前会话的选择（默认 false），不可用时强制关。
+     */
+    fun refreshToolAvailability() {
+        val cfg = runCatching { configRepository.load() }.getOrNull() ?: return
+        val available = ProviderPresets.isDeepSeekCompatible(cfg.providerId, cfg.baseUrl) &&
+            cfg.model == "deepseek-flash"
+        _toolState.update { st ->
+            st.copy(
+                thinkingEnabled = if (available) cfg.thinkingEnabled else false,
+                thinkingAvailable = available,
+                webSearchAvailable = available,
+                webSearchEnabled = if (available) st.webSearchEnabled else false
+            )
+        }
+    }
+
+    /** 深度思考开/关：持久化到配置（下次进 App 记住），并刷新 UI 状态。 */
+    fun setThinkingEnabled(enabled: Boolean) {
+        val cfg = runCatching { configRepository.load() }.getOrNull() ?: return
+        runCatching { configRepository.save(cfg.copy(thinkingEnabled = enabled)) }
+        _toolState.update { it.copy(thinkingEnabled = enabled) }
+    }
+
+    /**
+     * 智能搜索（联网）开/关：**只改本次会话的内存状态，不落盘** —— 每次开 App 默认关。
+     * 不可用时忽略（胶囊已置灰）。
+     */
+    fun setWebSearchEnabled(enabled: Boolean) {
+        _toolState.update {
+            if (!it.webSearchAvailable) it else it.copy(webSearchEnabled = enabled)
+        }
+    }
+
+    /**
+     * 回前台时把「智能搜索」强制关掉（2026-11-23）。
+     *
+     * 用户要求「每次打开 App 默认关、想联网手动点」，并明确怕「忘了还开着白烧 token」。
+     * 联网开关本就不落盘（进程死了自然没了），这里再在每次回到前台时重置一次，
+     * 避免进程常驻后台很久、开关一直开着。**深度思考不受影响**（那是持久化的偏好）。
+     */
+    fun resetWebSearchOnForeground() {
+        _toolState.update { if (it.webSearchEnabled) it.copy(webSearchEnabled = false) else it }
+    }
+
     // ---------- 内部实现 ----------
 
     private suspend fun initConversation() {
-        val all = conversationDao.getAll()
-        // 优先打开最近一个「有消息」的会话：避免启动时停在一个空白的「新对话」，
-        // 让用户误以为历史消息没了（历史都在别的会话里）。
-        val existing = all.firstOrNull { messageDao.countByConversation(it.id) > 0 } ?: all.firstOrNull()
-        val id = existing?.id ?: conversationDao.insert(
-            ConversationEntity(title = DEFAULT_TITLE, createTime = now(), lastMessageTime = now())
-        )
-        conversationId = id
-        val history = messageDao.getByConversation(id)
-        val lastAssistantUsage = history.lastOrNull {
-            it.role == MessageRole.ASSISTANT && it.tokPerSec != null
+        // 2026-11-22：先按当前模式挑会话。陪聊模式仍沿用「优先最近一个有消息的会话」，
+        // 只是多了一条「排除正常模式那个会话」——否则从正常模式切回陪聊会停在问答会话里。
+        try {
+            chatMode = runCatching { configRepository.getChatMode() }.getOrDefault(ChatMode.COMPANION)
+            loadConversationIntoUi(conversationFor(chatMode))
+        } finally {
+            _initialLoadDone.value = true
         }
-        _uiState.value = ChatUiState(
-            messages = history.map(::toUi),
-            tokPerSec = lastAssistantUsage?.tokPerSec,
-            cacheHitRatio = lastAssistantUsage?.cacheHit,
-            contextUsage = lastAssistantUsage?.contextUsage,
-            currentConversationId = id
-        )
     }
 
     private suspend fun handleSend(text: String, imageUris: List<Uri>) {
@@ -339,10 +495,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val reminder = if (cfg.latestReminderEnabled &&
             ProviderPresets.isDeepSeekCompatible(cfg.providerId, cfg.baseUrl)
         ) {
-            UserMetaMarker.build(
-                location = manualCityName() ?: "",
-                weather = weatherLine()
-            )
+            // 2026-11-22：正常模式只发「日期,星期」两段（地点/平台/语言/天气都是陪伴语义）
+            if (chatMode == ChatMode.NORMAL) {
+                UserMetaMarker.buildNormal()
+            } else {
+                UserMetaMarker.build(
+                    location = displayCityName() ?: "",
+                    weather = weatherLine()
+                )
+            }
         } else {
             null
         }
@@ -358,17 +519,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         )
         val userId = messageDao.insert(userEntity)
         conversationDao.updateLastMessageTime(convId, now())
-        // 记录本次用户交互时间（任务 3.4 决策闸门「冷却 < 2h」用）
-        appStateDao.put(AppStateEntity(AppStateEntity.KEY_LAST_INTERACTION, now().toString()))
-        // 任务 3.3：若用户这句是「提醒/叫醒」指令且含时间 → 设精确闹钟（到点投队列，3.5 送达）。
-        // 已在本 IO 协程内，失败静默不影响主对话。任务 3.7：记录排钟结果，便于真机排查。
-        runCatching { appContainer.reminderService.scheduleFromText(text) }
-            .onSuccess { r ->
-                if (r != null) android.util.Log.d(
-                    "Reminder", "已排钟：${r.taskDesc} @ ${r.triggerAtMillis} (req=${r.requestCode})"
-                )
-            }
-            .onFailure { android.util.Log.w("Reminder", "排钟失败", it) }
+        // 正常模式（2026-11-22）：不记账、不排钟。问答不该影响「她多久没被陪」的冷却闸门，
+        // 也不该把「明天九点开会」这种技术性陈述排成提醒闹钟。
+        if (chatMode == ChatMode.COMPANION) {
+            // 记录本次用户交互时间（任务 3.4 决策闸门「冷却 < 2h」用）
+            appStateDao.put(AppStateEntity(AppStateEntity.KEY_LAST_INTERACTION, now().toString()))
+            // 任务 3.3：若用户这句是「提醒/叫醒」指令且含时间 → 设精确闹钟（到点投队列，3.5 送达）。
+            // 已在本 IO 协程内，失败静默不影响主对话。任务 3.7：记录排钟结果，便于真机排查。
+            runCatching { appContainer.reminderService.scheduleFromText(text) }
+                .onSuccess { r ->
+                    if (r != null) android.util.Log.d(
+                        "Reminder", "已排钟：${r.taskDesc} @ ${r.triggerAtMillis} (req=${r.requestCode})"
+                    )
+                }
+                .onFailure { android.util.Log.w("Reminder", "排钟失败", it) }
+        }
         _uiState.update {
             it.copy(
                 messages = it.messages + MessageUiModel(
@@ -400,9 +565,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }.getOrNull()
     }
 
-    /** 手动城市名（设置页搜到的）；自动定位模式没有城市名 → null。 */
-    private suspend fun manualCityName(): String? =
-        runCatching { appContainer.locationCache.manualCityName() }.getOrNull()
+    /**
+     * 注记第 3 段（地点）该用的地名（2026-11-22）：**手填城市优先，其次自动定位反查结果**。
+     *
+     * 此前只取手填城市，自动定位模式下这段永远是空的 —— 模型能报天气，却答不出
+     * 「你在哪座城市」。反查在「每天首次前台刷新定位」时后台做一次并落库，
+     * 这里**只读缓存，绝不联网**（联网放发送路径 = 1.1.0 那个「消息半天不上屏」的坑）。
+     */
+    private suspend fun displayCityName(): String? =
+        runCatching { appContainer.locationCache.displayCityName() }.getOrNull()
 
     /**
      * 后台预热天气缓存（V2.1.8）：进聊天页时异步拉一次，之后发消息就能秒读缓存。
@@ -414,11 +585,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun prefetchWeather() {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                val point = when (val city = appContainer.locationCache.current()) {
-                    is LocatedCity.Manual -> city.point
-                    is LocatedCity.Auto -> city.point
-                }
-                appContainer.weatherCache.loadWithRetry(point, java.time.LocalDate.now())
+                // 2026-11-22：LocatedCity 现在直接给 point，不再写两边分支相同的 when
+                appContainer.weatherCache.loadWithRetry(
+                    appContainer.locationCache.current().point,
+                    java.time.LocalDate.now(),
+                )
             }
         }
     }
@@ -453,81 +624,104 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             baseConfig
         }
 
+        // 联网搜索是否生效（2026-11-23）：带图轮不联网（图走视觉、联网走纯文本检索）；
+        // 且必须是 DeepSeek 官方兼容 + flash（refreshToolAvailability 已保证，这里再兜一次）。
+        val webSearchOn = images.isEmpty() &&
+            _toolState.value.webSearchEnabled &&
+            _toolState.value.webSearchAvailable
+
         // 取本轮 user（最后一条 user 消息）与历史（不含本轮）
         val history = messageDao.getByConversation(convId)
         val currentUser = history.lastOrNull { it.role == MessageRole.USER } ?: return
         val past = history.filter { it.id != currentUser.id }
 
-        // 2026-11-21：主对话记忆注入。短期走向量相似度筛（阈值 0.45），长期/日记是稳定内容。
-        // 预算取上下文窗口的 12%（≈ token），由 ContextTrimmer 之外的独立额度控制 ——
-        // 记忆块自己先按预算裁好，避免把对话历史挤掉。没相关记忆时返回 null，一个字都不加。
-        val memoryDiag = StringBuilder()
-        // 2026-11-22 深度回忆：命中「记不记得 / 我上次 / 之前说的」等**过去回忆词**（且开关打开）时，
-        // 让 App 放宽窗口/阈值多翻一遍记忆。未来/待办句（"明天要开会"）由检测器排除，不会误触发。
-        val deepRecall = runCatching {
-            RecallTriggerDetector.detect(currentUser.content).triggered &&
-                configRepository.getDeepRecallEnabled()
-        }.getOrDefault(false)
-        // 1.9.4.0：情绪回忆按需筛选（冷却 + 情绪加权 + boost tiebreaker），注入后逐条记账。
-        val emotionalCandidates = runCatching {
-            val st = appContainer.moodService.currentEmotionState()
-            val dominant = st.hers.emotions.entries.maxByOrNull { it.value }?.key
-            appContainer.emotionalMemoryService.injectable(dominant)
-        }.getOrDefault(emptyList())
-        val memoryBlock = runCatching {
-            appContainer.memoryContextProvider.build(
-                userText = currentUser.content,
-                // 深度回忆轮给更大记忆预算（18%），平时 12%
-                budgetChars = (effectiveConfig.contextWindow *
-                    (if (deepRecall) MEMORY_CONTEXT_RATIO_RECALL else MEMORY_CONTEXT_RATIO)).toInt(),
-                emotional = emotionalCandidates.map { it.second },
-                recallMode = deepRecall,
-                // 2026-11-21：把每条候选的相似度分数打出来 —— 调阈值时只能靠这个，不能靠猜
-                onDiagnostics = { memoryDiag.append(it) }
-            )
-        }.getOrNull()
-        // 1.9.4.0：只有候选正文真的进了本轮记忆块才算"被回忆"，逐条刷新注入时刻 + 每日一次 boost。
-        if (!memoryBlock.isNullOrBlank()) {
-            runCatching {
-                emotionalCandidates.filter { memoryBlock.contains(it.second) }.forEach {
-                    appContainer.emotionalMemoryService.recall(it.first)
+        val companion = chatMode == ChatMode.COMPANION
+
+        // 2026-11-22：正常模式这三块**全不做**，连记忆查询和情绪读取都不发。
+        // 它们是陪伴语义；注入进去只会把问答拽回"陪聊"的调子，还白花 token。
+        var memoryBlock: String? = null
+        var emotionBlock: String? = null
+        var relationshipNote: String? = null
+
+        if (companion) {
+            // 2026-11-21：主对话记忆注入。短期走向量相似度筛（阈值 0.45），长期/日记是稳定内容。
+            // 预算取上下文窗口的 12%（≈ token），由 ContextTrimmer 之外的独立额度控制 ——
+            // 记忆块自己先按预算裁好，避免把对话历史挤掉。没相关记忆时返回 null，一个字都不加。
+            val memoryDiag = StringBuilder()
+            // 2026-11-22 深度回忆：命中「记不记得 / 我上次 / 之前说的」等**过去回忆词**（且开关打开）时，
+            // 让 App 放宽窗口/阈值多翻一遍记忆。未来/待办句（"明天要开会"）由检测器排除，不会误触发。
+            val deepRecall = runCatching {
+                RecallTriggerDetector.detect(currentUser.content).triggered &&
+                    configRepository.getDeepRecallEnabled()
+            }.getOrDefault(false)
+            // 1.9.4.0：情绪回忆按需筛选（冷却 + 情绪加权 + boost tiebreaker），注入后逐条记账。
+            val emotionalCandidates = runCatching {
+                val st = appContainer.moodService.currentEmotionState()
+                val dominant = st.hers.emotions.entries.maxByOrNull { it.value }?.key
+                appContainer.emotionalMemoryService.injectable(dominant)
+            }.getOrDefault(emptyList())
+            val block = runCatching {
+                appContainer.memoryContextProvider.build(
+                    userText = currentUser.content,
+                    // 深度回忆轮给更大记忆预算（18%），平时 12%
+                    budgetChars = (effectiveConfig.contextWindow *
+                        (if (deepRecall) MEMORY_CONTEXT_RATIO_RECALL else MEMORY_CONTEXT_RATIO)).toInt(),
+                    emotional = emotionalCandidates.map { it.second },
+                    recallMode = deepRecall,
+                    // 2026-11-21：把每条候选的相似度分数打出来 —— 调阈值时只能靠这个，不能靠猜
+                    onDiagnostics = { memoryDiag.append(it) }
+                )
+            }.getOrNull()
+            memoryBlock = block
+            // 1.9.4.0：只有候选正文真的进了本轮记忆块才算"被回忆"，逐条刷新注入时刻 + 每日一次 boost。
+            if (!block.isNullOrBlank()) {
+                runCatching {
+                    emotionalCandidates.filter { block.contains(it.second) }.forEach {
+                        appContainer.emotionalMemoryService.recall(it.first)
+                    }
                 }
             }
-        }
-        // W 级（真机 D 级常被 ROM 吞）：用来核对「这轮到底注入了多少字记忆」+ 每条分数，
-        // 0 = 没有相关记忆（正常，说明省 token 路径生效）
-        android.util.Log.w(
-            "MemoryCtx",
-            "本轮注入记忆块 ${memoryBlock?.length ?: 0} 字${if (deepRecall) "[深度回忆]" else ""}｜$memoryDiag"
-        )
-        // 2026-11-21 情绪系统 P1：尾部状态块（情绪 → 记忆）。它只改"她怎么说"，所以永远注入，
-        // 不参与记忆块的 12% 预算；自身长度由 EmotionPhrase 控制在 ~70 字。
-        val emotionBlock = runCatching { appContainer.moodService.renderEmotionBlock() }.getOrNull()
-        android.util.Log.w(
-            "EmotionCtx",
-            "本轮注入情绪块 ${emotionBlock?.length ?: 0} 字｜${emotionBlock?.replace("\n", " ／ ") ?: "-"}"
-        )
-
-        val context = ContextBuilder.build(
-            persona = configRepository.getPersona(),
-            longMemoryDigest = null, // 长期记忆由 memoryBlock 一起给出（不重复注入）
-            history = past,
-            currentUserText = currentUser.content,
-            currentReminder = currentUser.reminder,
-            contextWindow = effectiveConfig.contextWindow,
-            capabilityNote = ContextBuilder.CAPABILITIES,
-            memoryBlock = memoryBlock,
-            emotionBlock = emotionBlock,
+            // W 级（真机 D 级常被 ROM 吞）：用来核对「这轮到底注入了多少字记忆」+ 每条分数，
+            // 0 = 没有相关记忆（正常，说明省 token 路径生效）
+            android.util.Log.w(
+                "MemoryCtx",
+                "本轮注入记忆块 ${block?.length ?: 0} 字${if (deepRecall) "[深度回忆]" else ""}｜$memoryDiag"
+            )
+            // 2026-11-21 情绪系统 P1：尾部状态块（情绪 → 记忆）。它只改"她怎么说"，所以永远注入，
+            // 不参与记忆块的 12% 预算；自身长度由 EmotionPhrase 控制在 ~70 字。
+            emotionBlock = runCatching { appContainer.moodService.renderEmotionBlock() }.getOrNull()
+            android.util.Log.w(
+                "EmotionCtx",
+                "本轮注入情绪块 ${emotionBlock?.length ?: 0} 字｜${emotionBlock?.replace("\n", " ／ ") ?: "-"}"
+            )
             // P3：关系阶段（生疏/熟悉/亲近）—— 变化极慢，放稳定前缀
             relationshipNote = runCatching {
                 com.companion.chat.domain.emotion.RelationshipStage.promptHint(
                     appContainer.moodService.currentRelationshipStage()
                 )
             }.getOrNull()
+        } else {
+            android.util.Log.w("ChatMode", "正常模式：不注入人设 / 能力 / 记忆 / 情绪 / 关系")
+        }
+
+        val context = ContextBuilder.build(
+            persona = if (companion) configRepository.getPersona() else "",
+            longMemoryDigest = null, // 长期记忆由 memoryBlock 一起给出（不重复注入）
+            history = past,
+            currentUserText = currentUser.content,
+            currentReminder = currentUser.reminder,
+            contextWindow = effectiveConfig.contextWindow,
+            capabilityNote = if (companion) ContextBuilder.CAPABILITIES else null,
+            memoryBlock = memoryBlock,
+            emotionBlock = emotionBlock,
+            relationshipNote = relationshipNote,
+            mode = chatMode
         )
 
         // 新建会话首条且标题仍是默认值 → 本次请求顺带生成标题（仅 DeepSeek 兼容端点支持 title）
+        // 2026-11-23：联网轮次**不能**和 title 同传（服务端 400），所以联网时干脆不请求标题，靠前缀兜底。
         val needTitle = effectiveConfig.autoTitleEnabled &&
+            !webSearchOn &&
             ProviderPresets.isDeepSeekCompatible(effectiveConfig.providerId, effectiveConfig.baseUrl) &&
             needsTitle(convId)
 
@@ -547,6 +741,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         var success = false
         var attempt = 0
         var titleText: String? = null
+        // 联网引用按 url 去重累积（同一条回复引用同一网页只留一条）
+        val citationsAcc = LinkedHashMap<String, Citation>()
+        // 联网时先亮「正在搜索…」，正文一开始流就熄灭（见下面的 Delta / Citations 分支）
+        if (webSearchOn) _toolState.update { it.copy(searching = true) }
         // title 为 chat/completions 顶层参数，个别情况可能被拒(400)：命中则去掉 title 重试一次
         var titleEnabledNow = needTitle
         val maxAttempts = 2
@@ -559,13 +757,22 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val opts = ChatOptions(
                     titleEnabled = titleEnabledNow,
-                    thinkingEnabled = effectiveConfig.thinkingEnabled
+                    thinkingEnabled = effectiveConfig.thinkingEnabled,
+                    webSearchEnabled = webSearchOn
                 )
                 apiClient.streamChat(effectiveConfig, context, images = images, opts = opts).collect { ev ->
                     when (ev) {
                         is StreamEvent.Delta -> {
+                            if (_toolState.value.searching) _toolState.update { it.copy(searching = false) }
                             builder.append(ev.text)
                             updateAssistantText(tempId, builder.toString())
+                        }
+                        is StreamEvent.Citations -> {
+                            ev.citations.forEach { c ->
+                                if (c.url.isNotBlank() && !citationsAcc.containsKey(c.url)) {
+                                    citationsAcc[c.url] = c
+                                }
+                            }
                         }
                         is StreamEvent.Title -> {
                             titleText = ev.text
@@ -596,11 +803,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
+        // 无论成功失败，流结束都要熄灭「正在搜索…」
+        if (_toolState.value.searching) _toolState.update { it.copy(searching = false) }
+
         if (success) {
             // 2026-11-21 情绪系统 P1：主导情绪 ≥0.5 时给回复加一个颜文字（代码追加，不劳模型）。
             // 存库前追加 → 历史回传也带 → 她会逐渐学会这个风格；末尾去重防"双份"。
-            val emotionNow = runCatching { appContainer.moodService.currentEmotionState() }.getOrNull()
-            val finalText = EmotionKaomoji.append(builder.toString(), emotionNow?.hers?.emotions.orEmpty())
+            // 2026-11-22：正常模式不加 —— 问答回复后面挂个 (｡•́︿•̀｡) 很奇怪。
+            val finalText = if (companion) {
+                val emotionNow = runCatching { appContainer.moodService.currentEmotionState() }.getOrNull()
+                EmotionKaomoji.append(builder.toString(), emotionNow?.hers?.emotions.orEmpty())
+            } else {
+                builder.toString()
+            }
+            val finalCitations = citationsAcc.values.toList()
             val assistant = MessageEntity(
                 conversationId = convId,
                 role = MessageRole.ASSISTANT,
@@ -608,7 +824,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 timestamp = now(),
                 tokPerSec = usage?.tokPerSec,
                 cacheHit = usage?.cacheHitRatio,
-                contextUsage = usage?.contextUsage
+                contextUsage = usage?.contextUsage,
+                // 联网引用随消息落库（灰色折叠来源可在此后任意时刻回看）
+                citations = CitationCodec.encode(finalCitations)
             )
             val realId = messageDao.insert(assistant)
             conversationDao.updateLastMessageTime(convId, now())
@@ -619,7 +837,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             _uiState.update { st ->
                 st.copy(
                     messages = st.messages.map {
-                        if (it.id == tempId) MessageUiModel(realId, finalText, false, assistant.timestamp) else it
+                        if (it.id == tempId) {
+                            MessageUiModel(
+                                id = realId,
+                                content = finalText,
+                                isUser = false,
+                                timestamp = assistant.timestamp,
+                                citations = finalCitations
+                            )
+                        } else it
                     },
                     isStreaming = false,
                     tokPerSec = usage?.tokPerSec ?: st.tokPerSec,
@@ -628,49 +854,54 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     canRetry = false
                 )
             }
-            // 任务 2.2/2.3：主对话成功后，后台异步提取 + 语义去重落库（独立调用、失败静默，不影响主对话）
-            viewModelScope.launch(Dispatchers.IO) {
-                // 1.9.4.0：用户明确嫌烦（"别提/烦不烦"…）→ 最近被想起的情绪记忆扣分 + 冷却。
-                runCatching { appContainer.emotionalMemoryService.onDislike(currentUser.content) }
-                runCatching {
-                    val recent = messageDao.getRecent(convId, MEMORY_RECENT_MESSAGES)
-                    val ex = appContainer.memoryExtractor.extract(effectiveConfig, recent).getOrNull()
-                        ?: return@runCatching
-                    if (!ex.isEmpty) {
-                        // 语义去重需要向量：懒加载本地模型（首次较慢，之后复用；失败自动退回精确去重）
-                        appContainer.ensureEmbeddingService()
-                        appContainer.memoryExtractor.store(ex)
-                        // 2026-11-20：写入后立刻做容量淘汰（攒满 50 清 20，保护新增/活跃任务）。
-                        // 放这里而不是定时扫：用户要的是「攒满即触发」，且半夜删记忆无法解释。
-                        runCatching { appContainer.memoryCapacityEnforcer.enforceOnce() }
+            // 2026-11-22：正常模式**这四件事全不做** —— 问答内容不进记忆库、不参与情绪判定、
+            // 不产生追问任务、也不给情感记忆记账。否则问一句「这段 Kotlin 为什么崩」
+            // 会被当成聊天记进长期记忆，还会被判成「她今天情绪低落」。
+            if (companion) {
+                // 任务 2.2/2.3：主对话成功后，后台异步提取 + 语义去重落库（独立调用、失败静默，不影响主对话）
+                viewModelScope.launch(Dispatchers.IO) {
+                    // 1.9.4.0：用户明确嫌烦（"别提/烦不烦"…）→ 最近被想起的情绪记忆扣分 + 冷却。
+                    runCatching { appContainer.emotionalMemoryService.onDislike(currentUser.content) }
+                    runCatching {
+                        val recent = messageDao.getRecent(convId, MEMORY_RECENT_MESSAGES)
+                        val ex = appContainer.memoryExtractor.extract(effectiveConfig, recent).getOrNull()
+                            ?: return@runCatching
+                        if (!ex.isEmpty) {
+                            // 语义去重需要向量：懒加载本地模型（首次较慢，之后复用；失败自动退回精确去重）
+                            appContainer.ensureEmbeddingService()
+                            appContainer.memoryExtractor.store(ex)
+                            // 2026-11-20：写入后立刻做容量淘汰（攒满 50 清 20，保护新增/活跃任务）。
+                            // 放这里而不是定时扫：用户要的是「攒满即触发」，且半夜删记忆无法解释。
+                            runCatching { appContainer.memoryCapacityEnforcer.enforceOnce() }
+                        }
                     }
-                }
-                // 任务 5.1：每 5 轮更新一次 mood（独立调用，失败保持原 mood，绝不影响主对话）
-                runCatching {
-                    val recentForMood = messageDao.getRecent(convId, MOOD_RECENT_MESSAGES)
-                    val attempted = appContainer.moodService.onTurnCompleted(effectiveConfig, recentForMood)
-                    if (attempted) {
-                        val mood = appContainer.moodService.currentMood()
-                        val reason = appContainer.moodService.currentReason()
-                        android.util.Log.d(
-                            "Mood",
-                            "第${appContainer.moodService.turnCount()}轮 触发mood更新 -> mood=$mood reason=$reason"
-                        )
+                    // 任务 5.1：每 5 轮更新一次 mood（独立调用，失败保持原 mood，绝不影响主对话）
+                    runCatching {
+                        val recentForMood = messageDao.getRecent(convId, MOOD_RECENT_MESSAGES)
+                        val attempted = appContainer.moodService.onTurnCompleted(effectiveConfig, recentForMood)
+                        if (attempted) {
+                            val mood = appContainer.moodService.currentMood()
+                            val reason = appContainer.moodService.currentReason()
+                            android.util.Log.d(
+                                "Mood",
+                                "第${appContainer.moodService.turnCount()}轮 触发mood更新 -> mood=$mood reason=$reason"
+                            )
+                        }
                     }
-                }
-                // V2.2.3 追问任务创建：**追问链唯一的入口**（2026-11-20 接入）。
-                // 之前这个类写好了、单测 10 条全绿、CompanionApp 也 lazy 出来了，但全项目零调用
-                // → reminders 表永远建不出 followup 行 → V2.2.2/2.2.3/2.2.4/2.2.5 四个任务的功能
-                // 在真机上一次都不会发生（不会追问、通知上的「已完成/再等等」永不出现）。
-                //
-                // 放在主对话成功之后、fire-and-forget：内部自带三道闸门
-                // （① 意图闸门零成本 → ② anyPendingFollowup 预检 → ③ 实例 Mutex 权威复查），
-                // 普通闲聊连模型都不会调，失败也不影响主对话。
-                runCatching {
-                    val recentForFollowup = messageDao.getRecent(convId, FOLLOWUP_RECENT_MESSAGES)
-                    appContainer.followupTaskExtractor.extractAndSchedule(effectiveConfig, recentForFollowup)
-                }.onFailure {
-                    android.util.Log.w("Followup", "追问任务提取失败（不影响主对话）", it)
+                    // V2.2.3 追问任务创建：**追问链唯一的入口**（2026-11-20 接入）。
+                    // 之前这个类写好了、单测 10 条全绿、CompanionApp 也 lazy 出来了，但全项目零调用
+                    // → reminders 表永远建不出 followup 行 → V2.2.2/2.2.3/2.2.4/2.2.5 四个任务的功能
+                    // 在真机上一次都不会发生（不会追问、通知上的「已完成/再等等」永不出现）。
+                    //
+                    // 放在主对话成功之后、fire-and-forget：内部自带三道闸门
+                    // （① 意图闸门零成本 → ② anyPendingFollowup 预检 → ③ 实例 Mutex 权威复查），
+                    // 普通闲聊连模型都不会调，失败也不影响主对话。
+                    runCatching {
+                        val recentForFollowup = messageDao.getRecent(convId, FOLLOWUP_RECENT_MESSAGES)
+                        appContainer.followupTaskExtractor.extractAndSchedule(effectiveConfig, recentForFollowup)
+                    }.onFailure {
+                        android.util.Log.w("Followup", "追问任务提取失败（不影响主对话）", it)
+                    }
                 }
             }
         } else {
@@ -710,7 +941,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             content = if (e.content.isBlank() && e.role == MessageRole.USER && paths.isEmpty()) "[图片]" else e.content,
             isUser = e.role == MessageRole.USER,
             timestamp = e.timestamp,
-            imagePaths = paths
+            imagePaths = paths,
+            citations = CitationCodec.decode(e.citations)
         )
     }
 
@@ -740,6 +972,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         private const val RETRY_DELAY_MS = 1500L
         private const val DEFAULT_TITLE = "新对话"
+        /** 正常模式专属会话的初始标题（2026-11-22）。有自动标题时很快会被改成问的内容。 */
+        private const val NORMAL_CONVERSATION_TITLE = "正常对话"
         private const val TITLE_MAX_LEN = 12
 
         /** 记忆提取喂给模型的最近消息条数（3 轮 ≈ 3 user + 3 assistant）。 */

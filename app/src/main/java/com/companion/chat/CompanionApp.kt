@@ -19,6 +19,7 @@ import com.companion.chat.data.alarm.BootRestorePlanner
 import com.companion.chat.data.alarm.FollowupAlarms
 import com.companion.chat.data.alarm.ReminderService
 import com.companion.chat.data.calendar.FestivalProvider
+import com.companion.chat.data.environment.AndroidCityNameLookup
 import com.companion.chat.data.environment.AndroidLocationPort
 import com.companion.chat.data.environment.CityGeocoder
 import com.companion.chat.data.environment.LocationCache
@@ -53,6 +54,9 @@ import com.companion.chat.data.proactive.ProactiveTestTrigger
 import com.companion.chat.data.proactive.RoomConversationWriter
 import com.companion.chat.data.proactive.SpecialDateHookService
 import com.companion.chat.data.proactive.TtsProactiveSpeaker
+import com.companion.chat.data.daily.DailyTaskNotifier
+import com.companion.chat.data.daily.DailyTaskRunner
+import com.companion.chat.data.daily.DailyTaskScheduler
 import com.companion.chat.data.proactive.DefaultProactiveGate
 import com.companion.chat.data.remote.ChatApiClient
 import com.companion.chat.data.remote.ChatOptions
@@ -112,8 +116,13 @@ class CompanionApp : Application() {
     val envStore: RoomKeyValueStore by lazy { RoomKeyValueStore(database.appStateDao()) }
     /** 定位缓存：手动城市优先，其次系统定位（V2.1.1）。 */
     val locationCache: LocationCache by lazy {
-        LocationCache(envStore, AndroidLocationPort(this))
+        LocationCache(envStore, AndroidLocationPort(this), cityNameLookup)
     }
+    /**
+     * 坐标 → 城市名（2026-11-22）：自动定位模式下，把反查到的地名填进
+     * `latest_reminder` 第 3 段。只在每天首次前台刷新定位时调一次，发送路径不碰。
+     */
+    val cityNameLookup: AndroidCityNameLookup by lazy { AndroidCityNameLookup(this) }
     /** 城市名 → 经纬度（V2.1.1）。 */
     val cityGeocoder: CityGeocoder by lazy {
         CityGeocoder(envStore, OkHttpHttpText())
@@ -380,6 +389,25 @@ class CompanionApp : Application() {
 
     /** AlarmManager 精确闹钟（任务 3.3）。 */
     val alarmScheduler: AlarmScheduler by lazy { AlarmScheduler(this) }
+
+    /** 每日任务闹钟编排（2026-11-23）：每条启用任务一个 setAlarmClock，到点续排+触发 Worker。 */
+    val dailyTaskScheduler: DailyTaskScheduler by lazy {
+        DailyTaskScheduler(alarmScheduler, database.dailyTaskDao())
+    }
+
+    /** 每日任务执行（2026-11-23）：生成 → 写专属会话（今天覆盖昨天）→ 通知 → 可选语音。 */
+    val dailyTaskRunner: DailyTaskRunner by lazy {
+        DailyTaskRunner(
+            apiClient = chatApiClient,
+            configProvider = { configRepository.load() },
+            personaProvider = { configRepository.getPersona() },
+            conversationDao = database.conversationDao(),
+            messageDao = database.messageDao(),
+            dailyTaskDao = database.dailyTaskDao(),
+            notifier = DailyTaskNotifier(this),
+            speak = { text -> readAloudController.speak(text) }
+        )
+    }
 
     /**
      * 环境钩子服务（V2.1.4）：整点检查（[AlarmKind.ENV_CHECK]）触发 recall → enqueue。
@@ -721,6 +749,8 @@ class CompanionApp : Application() {
         // 未来提醒的启动期轻量重排（B9 补充）：覆盖「闹钟被清但收不到 BOOT_COMPLETED」的
         // force-stop / ROM 清后台场景。只排 triggerTime > now，不会重放历史。
         appScope.launch { restorePendingRemindersLight() }
+        // 2026-11-23：每日任务闹钟的启动期重排（幂等），覆盖闹钟被 ROM 清掉的情况。
+        appScope.launch { runCatching { dailyTaskScheduler.syncAll() } }
         // 环境设置变更 → 立即重新同步整点闹钟。挂在 ConfigRepository 的保存回调上，
         // 设置页任何一个保存入口都会覆盖到（不必依赖 UI 线额外接线）。
         configRepository.onEnvironmentSettingsChanged = {
@@ -893,6 +923,10 @@ class CompanionApp : Application() {
                 .onFailure { android.util.Log.w("BootRestore", "接续调试快速检查失败: ${it.message}") }
         }
 
+        // d) 每日任务：全量重排（幂等；被禁用/删除的会被取消）。闹钟重启后同样被清空，必须补排。
+        runCatching { dailyTaskScheduler.syncAll() }
+            .onFailure { android.util.Log.w("BootRestore", "每日任务重排失败: ${it.message}") }
+
         return BootRestoreReport(
             envScheduledAt = envAt,
             remindersPending = pending.size,
@@ -1029,6 +1063,9 @@ class CompanionApp : Application() {
             .onFailure { android.util.Log.w("TimeChange", "重排环境整点失败: ${it.message}") }
         runCatching { restorePendingRemindersLight() }
             .onFailure { android.util.Log.w("TimeChange", "重排提醒闹钟失败: ${it.message}") }
+        // 2026-11-23：每日任务按新时钟重排（nextOccurrence 用同一个 zone.now 计算）
+        runCatching { dailyTaskScheduler.syncAll() }
+            .onFailure { android.util.Log.w("TimeChange", "重排每日任务失败: ${it.message}") }
         android.util.Log.w("TimeChange", "系统时间变更后的排程重排完成")
     }
 

@@ -1,5 +1,11 @@
 package com.companion.chat.ui.settings
 
+import android.app.NotificationManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -21,12 +27,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.companion.chat.R
 import com.companion.chat.data.environment.CityGeocoder
 import com.companion.chat.data.environment.GeocodeOutcome
@@ -42,6 +53,7 @@ import com.companion.chat.domain.power.KeepAliveTarget
 import com.companion.chat.domain.proactive.ProactiveGateRules
 import com.companion.chat.domain.settings.EnvironmentSettings
 import com.companion.chat.ui.permission.rememberLocationPermission
+import com.companion.chat.domain.chat.ChatMode
 import com.companion.chat.ui.theme.LocalChatColors
 import kotlinx.coroutines.launch
 
@@ -83,6 +95,13 @@ data class SettingsForm(
     val jsonModeDefault: Boolean = false,
     // 2026-11-22：深度回忆（命中「记不记得/上次」等过去回忆词时专门多翻一遍记忆），默认开
     val deepRecallEnabled: Boolean = true,
+    /**
+     * 对话模式（2026-11-22）。默认 [ChatMode.COMPANION]。
+     *
+     * 正常模式下不注入人设/能力/关系/记忆/情绪，注记只发「日期,星期」，
+     * 且**使用独立会话**（历史物理隔离，见 `ChatMode` 注释）。
+     */
+    val chatMode: ChatMode = ChatMode.COMPANION,
     // ---- 任务 V2.1.6：环境感知（默认值与 EnvironmentSettings 一致） ----
     val environmentEnabled: Boolean = EnvironmentSettings.DEFAULT_ENVIRONMENT_ENABLED,
     val lateNightEnabled: Boolean = EnvironmentSettings.DEFAULT_LATE_NIGHT_ENABLED,
@@ -135,9 +154,10 @@ fun SettingsScreen(
     onResetKeepAliveGuide: () -> Unit = {},
     // ---- 任务 V2.1.6：环境感知 / 手动城市 / 关于 ----
     // 逻辑注入路径：CompanionApp 补齐 locationCache/cityGeocoder 后由 MainActivity 传入。
-    // 城市为空 = 未注入 → 输入框与搜索按钮自动隐藏。
-    cityGeocoder: CityGeocoder? = null,
-    locationCache: LocationCache? = null
+    // 2026-11-22：从可空降为必填——MainActivity 恒传，原来的「未注入 → 输入框禁用」分支
+    // 永远不会成立，留着只会让人以为城市搜索还没接线。
+    cityGeocoder: CityGeocoder,
+    locationCache: LocationCache
 ) {
     var form by remember { mutableStateOf(initial) }
     val context = LocalContext.current
@@ -152,26 +172,59 @@ fun SettingsScreen(
     var showNeedRootDialog by remember { mutableStateOf(false) }
     // 日志对话框开关独立于 keepAliveState：关掉对话框后状态要保留，否则日志就没了
     var showLogDialog by remember { mutableStateOf(false) }
-    // 1.7.0：人设默认收起。人设提示词通常是几百字的大段文本，常驻展开会让整页显得臃肿。
-    // 用 rememberSaveable 而不是 remember：转到后台再回来不该弹回展开态（离开设置页整棵树会销毁，
-    // 所以这里只保证"本次停留"内记住，不跨会话 —— 跨会话记忆要动 ConfigRepository，属逻辑线范围）。
-    var personaExpanded by rememberSaveable { mutableStateOf(false) }
+    // 1.7.0 的人设折叠已并入通用 CollapsibleSection（原 personaExpanded 变量移除）。
     // V2.1.1：粗定位权限状态（设置页只提供按钮，进页面不自动弹）
     val locationPermission = rememberLocationPermission(autoRequestOnce = false)
 
+    // 2026-11-22：通知权限状态自动刷新。
+    // 以前只在进页面读一次 + 手动点「刷新状态」，从系统设置/通知栏返回看到的是旧快照，
+    // 才会出现「实际关了却显示已开启」。这里双保险：
+    //  1) ON_RESUME（从系统设置返回）重读；
+    //  2) 监听系统通知开关广播（App 级 + 渠道级），用户一改就重读。
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) onRefreshPermissions()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    DisposableEffect(context) {
+        // 通知开关广播是 API 28+ 才有的；低于 28 只能靠上面的 ON_RESUME 刷新。
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            onDispose { }
+        } else {
+            val blockReceiver = object : BroadcastReceiver() {
+                override fun onReceive(c: Context?, i: Intent?) {
+                    onRefreshPermissions()
+                }
+            }
+            val filter = IntentFilter().apply {
+                addAction(NotificationManager.ACTION_APP_BLOCK_STATE_CHANGED)
+                addAction(NotificationManager.ACTION_NOTIFICATION_CHANNEL_BLOCK_STATE_CHANGED)
+            }
+            ContextCompat.registerReceiver(
+                context, blockReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+            onDispose { runCatching { context.unregisterReceiver(blockReceiver) } }
+        }
+    }
+
     // 手动城市回显 + 搜索（任务 V2.1.6）
     var manualCity by remember { mutableStateOf(initial.manualCity) }
+    /** 自动定位反查到的地名（2026-11-22）。只做回显，让用户知道自动模式识别到哪座城市。 */
+    var autoCity by remember { mutableStateOf("") }
     var citySearching by remember { mutableStateOf(false) }
 
     // 注入路径确认：LocationCache 在 app 容器；这里只拿结果回显
     LaunchedEffect(locationCache) {
-        locationCache?.let { manualCity = it.manualCityName() ?: "" }
+        manualCity = locationCache.manualCityName() ?: ""
+        autoCity = locationCache.autoCityName() ?: ""
     }
 
     suspend fun searchCity(query: String) {
-        val geocoder = cityGeocoder ?: return
         citySearching = true
-        val outcome = runCatching { geocoder.resolve(query) }.getOrElse { GeocodeOutcome.NetworkError }
+        val outcome = runCatching { cityGeocoder.resolve(query) }.getOrElse { GeocodeOutcome.NetworkError }
         citySearching = false
         when (outcome) {
             is GeocodeOutcome.Hit -> {
@@ -187,6 +240,7 @@ fun SettingsScreen(
             GeocodeOutcome.Cleared -> {
                 // 不弹 Toast（计划书约定）
                 manualCity = ""
+                autoCity = locationCache.autoCityName() ?: ""
             }
         }
     }
@@ -233,8 +287,31 @@ fun SettingsScreen(
                 onRefresh = onRefreshPermissions
             )
 
-            Spacer(Modifier.height(4.dp))
-            Text("模型与服务商", style = MaterialTheme.typography.titleMedium)
+            // 2026-11-22：对话模式。位置是用户指定的：在「她的状态」下方、「模型与服务商」上方。
+            // 刻意不放进折叠组：切模式是"这一轮我要换个说法"的即时意图，藏起来就找不到了。
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("对话模式", style = MaterialTheme.typography.titleMedium)
+                SwitchRow("正常模式（只当问答助手）", form.chatMode == ChatMode.NORMAL) { on ->
+                    form = form.copy(chatMode = if (on) ChatMode.NORMAL else ChatMode.COMPANION)
+                }
+                // 2026-11-22：两个模式的两句话**同时列出来**，当前模式那句用正文色、另一句用弱色。
+                // 只显示当前模式那句会让人误读（开关关着 = 陪聊，下面却写着"她有人设"，像"关掉才有"）。
+                ChatMode.values().forEach { mode ->
+                    Text(
+                        "${mode.label}：${mode.description}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (form.chatMode == mode) MaterialTheme.colorScheme.onSurface
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            CollapsibleSection(
+                title = "模型与服务商",
+                subtitle = (if (form.model.isBlank()) "未设置模型" else form.model) +
+                    " · " + (if (form.apiKey.isBlank()) "未填 Key" else "已配置 Key"),
+                initiallyExpanded = true
+            ) {
 
             DropdownField(
                 label = "服务商",
@@ -305,11 +382,8 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            Spacer(Modifier.height(8.dp))
-            Text("功能开关（DeepSeek 新 API）", style = MaterialTheme.typography.titleMedium)
-            SwitchRow("深度思考（慢、更聪明，默认关）", form.thinkingEnabled) {
-                form = form.copy(thinkingEnabled = it)
-            }
+            // 2026-11-23：深度思考开关已从设置页搬到聊天输入栏（两颗胶囊之一），这里不再提供 UI。
+            // 说明：SettingsForm 仍保留 thinkingEnabled 字段并在保存时原样写回（不重置），见 MainActivity.persist。
             SwitchRow("自动生成会话标题", form.autoTitleEnabled) {
                 form = form.copy(autoTitleEnabled = it)
             }
@@ -325,6 +399,15 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            }  // end 模型与服务商
+
+            CollapsibleSection(
+                title = "语音",
+                subtitle = "朗读" + (if (form.ttsEnabled) "开" else "关") +
+                    " · 语音输入" + (if (form.sttEnabled) "开" else "关"),
+                initiallyExpanded = true
+            ) {
+
             SwitchRow("官方语音（联网计费）", form.deepSeekTtsEnabled) {
                 form = form.copy(deepSeekTtsEnabled = it)
             }
@@ -354,16 +437,6 @@ fun SettingsScreen(
             }
             Text(
                 "关闭后输入框的麦克风按钮会隐藏，不会开麦。识别使用与聊天相同的 API Key（云端，按秒计费约 0.39 元/小时）。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            // V2.3.6：通知栏常驻快捷入口（关掉时 persist 会当场 sync 撤掉通知）
-            SwitchRow("通知栏常驻快捷入口（低优先级，可随时关闭）", form.quickAccessEnabled) {
-                form = form.copy(quickAccessEnabled = it)
-            }
-            Text(
-                "开启后通知栏常驻一条低优先级通知，点「🎙 语音输入」可直接说话，识别结果会填进输入框。需要通知权限。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -402,10 +475,57 @@ fun SettingsScreen(
                         }
                     )
                 }
-            }
+            }  // end if(ttsEnabled)
+            }  // end 语音
 
-            Spacer(Modifier.height(8.dp))
-            Text("主动消息", style = MaterialTheme.typography.titleMedium)
+            CollapsibleSection(
+                title = "通知与快捷入口",
+                subtitle = when {
+                    !form.quickAccessEnabled -> "常驻快捷入口：关"
+                    !permissionStatus.notificationsEnabled -> "想开 · 但通知权限没开"
+                    !permissionStatus.quickAccessChannelEnabled -> "想开 · 但渠道被关"
+                    else -> "常驻快捷入口：开"
+                },
+                initiallyExpanded = false
+            ) {
+            SwitchRow("通知栏常驻快捷入口（低优先级，可随时关闭）", form.quickAccessEnabled) {
+                form = form.copy(quickAccessEnabled = it)
+            }
+            Text(
+                "开启后通知栏常驻一条低优先级通知，点「🎙 语音输入」可直接说话，识别结果会填进输入框。需要通知权限。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            // 2026-11-22：开关开着、但通知其实弹不出来时，当场说清楚是「哪一层」被关了。
+            // 以前这里只显示"已开启"，用户以为没问题，其实渠道被 MIUI 单独关了。
+            if (form.quickAccessEnabled &&
+                (!permissionStatus.notificationsEnabled || !permissionStatus.quickAccessChannelEnabled)
+            ) {
+                val why = if (!permissionStatus.notificationsEnabled) {
+                    "整个 App 的通知权限被关了"
+                } else {
+                    "快捷入口的通知渠道被系统单独关掉了（App 通知权限是开的，只是这个渠道被关）"
+                }
+                Text(
+                    "⚠ 常驻通知现在发不出来：$why。点下面按钮去系统里重新打开。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+                OutlinedButton(onClick = onOpenNotificationSettings, modifier = Modifier.fillMaxWidth()) {
+                    Text("去开启通知权限")
+                }
+            }
+            }  // end 通知
+
+            CollapsibleSection(
+                title = "主动消息",
+                subtitle = if (form.proactiveEnabled) {
+                    "开 · 每日≤${form.proactiveDailyLimit}条" + (if (form.dndEnabled) " · 勿扰" else "")
+                } else {
+                    "关"
+                },
+                initiallyExpanded = false
+            ) {
             SwitchRow("主动消息总开关（关闭后不再主动搭话）", form.proactiveEnabled) {
                 form = form.copy(proactiveEnabled = it)
             }
@@ -454,10 +574,14 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-            }
+            }  // end if(dndEnabled)
+            }  // end 主动消息
 
-            Spacer(Modifier.height(8.dp))
-            Text("环境感知", style = MaterialTheme.typography.titleMedium)
+            CollapsibleSection(
+                title = "环境感知",
+                subtitle = if (form.environmentEnabled) "开 · 降雨≥${form.rainThreshold}% · 降温≥${form.tempDropThreshold}℃" else "关",
+                initiallyExpanded = false
+            ) {
             Text(
                 "熬夜 / 下雨 / 降温时主动关心你。天气按「手动城市」查，没设城市则只用时间规则。",
                 style = MaterialTheme.typography.bodySmall,
@@ -526,23 +650,21 @@ fun SettingsScreen(
             Text("手动城市", style = MaterialTheme.typography.titleMedium)
             Text(
                 when {
-                    cityGeocoder == null ->
-                        "城市搜索待接线（CompanionApp 尚未注入 CityGeocoder / LocationCache）。以下输入框先禁用。"
+                    manualCity.isBlank() && autoCity.isNotBlank() ->
+                        "当前使用自动定位（已识别：$autoCity）。输入城市名后搜索，可设为手动城市（此后天气以它为准）。"
                     manualCity.isBlank() ->
                         "当前使用自动定位。输入城市名后搜索，可设为手动城市（此后天气以它为准）。"
                     else ->
                         "当前手动城市：$manualCity（天气以它为准）。清空输入框再点搜索，可恢复自动定位。"
                 },
                 style = MaterialTheme.typography.bodySmall,
-                color = if (cityGeocoder == null) MaterialTheme.colorScheme.error
-                else MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             OutlinedTextField(
                 value = manualCity,
                 onValueChange = { manualCity = it },
                 label = { Text("城市名（如：北京）") },
                 singleLine = true,
-                enabled = cityGeocoder != null,
                 modifier = Modifier.fillMaxWidth()
             )
             Row(
@@ -551,85 +673,47 @@ fun SettingsScreen(
             ) {
                 Button(
                     onClick = { scope.launch { searchCity(manualCity) } },
-                    enabled = cityGeocoder != null && !citySearching,
+                    enabled = !citySearching,
                     modifier = Modifier.weight(1f)
                 ) {
                     Text(if (citySearching) "搜索中..." else "搜索并设为手动城市")
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
-            // 1.7.0：人设折叠。这段提示词通常几百字，常驻展开会让一个大输入框吃掉小半屏。
-            // 收起时只留标题 + 字数摘要。只响应「点标题」，刻意不做失焦自动收起 ——
-            // OutlinedTextField 离开组合会丢光标位置和内部滚动，那等于打断输入。
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { personaExpanded = !personaExpanded }
-                        .padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "人设",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Icon(
-                        if (personaExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                        contentDescription = if (personaExpanded) "收起人设" else "展开人设",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                if (!personaExpanded) {
-                    Text(
-                        if (form.persona.isBlank()) "未设置（用默认人设）· 点标题展开"
-                        else "已自定义 ${form.persona.length} 字 · 点标题展开",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                } else {
-                    OutlinedTextField(
-                        value = form.persona,
-                        onValueChange = { form = form.copy(persona = it) },
-                        label = { Text("人设提示词（性格 / 说话风格 / 称呼）") },
-                        minLines = 4,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Text(
-                        "示例：你叫小陪，是我温柔体贴的女朋友。说话口语化、偶尔撒娇，用「宝宝」称呼我。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
+            }  // end 环境感知
 
-            Spacer(Modifier.height(8.dp))
-            Text("主动消息测试", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "立即手动触发一次：决策 → 召回 → 生成 → 通知（绕过冷却/上限/勿扰）。点它会先保存当前设置。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            OutlinedButton(
-                onClick = {
-                    // 静默保存当前设置（不跳页、不 Toast），避免把触发协程所在作用域销毁
-                    onPersist(form)
-                    onTestProactive()
-                },
-                modifier = Modifier.fillMaxWidth()
+            CollapsibleSection(
+                title = "人设",
+                subtitle = if (form.persona.isBlank()) "未设置（用默认人设）" else "已自定义 ${form.persona.length} 字",
+                initiallyExpanded = false
             ) {
-                Text("立即触发一次主动消息")
-            }
+                OutlinedTextField(
+                    value = form.persona,
+                    onValueChange = { form = form.copy(persona = it) },
+                    label = { Text("人设提示词（性格 / 说话风格 / 称呼）") },
+                    minLines = 4,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text(
+                    "示例：你叫小陪，是我温柔体贴的女朋友。说话口语化、偶尔撒娇，用「宝宝」称呼我。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }  // end 人设
 
-            Spacer(Modifier.height(8.dp))
-            Text("系统权限与保活", style = MaterialTheme.typography.titleMedium)
+            CollapsibleSection(
+                title = "系统权限与保活",
+                subtitle = "通知" + (if (permissionStatus.notificationsEnabled && permissionStatus.quickAccessChannelEnabled) "✓" else "✗") +
+                    " · 闹钟" + (if (permissionStatus.exactAlarmAllowed) "✓" else "✗") +
+                    " · 电池" + (if (permissionStatus.ignoringBatteryOptimizations) "✓" else "✗"),
+                initiallyExpanded = false
+            ) {
             Text(
-                "这三项没开，主动消息可能不会按时弹出来。点右侧按钮跳系统设置，回来后点「刷新状态」。",
+                "这三项没开，主动消息可能不会按时弹出来。从系统设置返回后会自动刷新状态。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            PermissionRow("通知权限", permissionStatus.notificationsEnabled, "去开启", onOpenNotificationSettings)
+            PermissionRow("通知权限", permissionStatus.notificationsEnabled && permissionStatus.quickAccessChannelEnabled, "去开启", onOpenNotificationSettings)
             PermissionRow("精确闹钟", permissionStatus.exactAlarmAllowed, "去开启", onOpenExactAlarmSettings)
             PermissionRow(
                 "电池优化白名单",
@@ -666,8 +750,37 @@ fun SettingsScreen(
                     Text("关闭后台限制")
                 }
             }
-            TextButton(onClick = onResetKeepAliveGuide) { Text("查看保活引导（重新运行）") }
-            TextButton(onClick = onRefreshPermissions) { Text("刷新权限状态") }
+            }  // end 系统权限与保活
+
+            CollapsibleSection(
+                title = "高级 / 调试",
+                subtitle = "主动消息测试 · 保活引导 · 执行日志 · 关于",
+                initiallyExpanded = false
+            ) {
+            Text("主动消息测试", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "立即手动触发一次：决策 → 召回 → 生成 → 通知（绕过冷却/上限/勿扰）。点它会先保存当前设置。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedButton(
+                onClick = {
+                    // 静默保存当前设置（不跳页、不 Toast），避免把触发协程所在作用域销毁
+                    onPersist(form)
+                    onTestProactive()
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("立即触发一次主动消息")
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                TextButton(onClick = onResetKeepAliveGuide, modifier = Modifier.weight(1f)) { Text("查看保活引导") }
+                TextButton(onClick = onRefreshPermissions, modifier = Modifier.weight(1f)) { Text("刷新权限状态") }
+            }
 
             // ---- V2.4.3 一键保活（root）：调 su 把本包写进白名单 / 放开后台限制 ----
             Spacer(Modifier.height(8.dp))
@@ -722,6 +835,7 @@ fun SettingsScreen(
             TextButton(onClick = { uriHandler.openUri("https://open-meteo.com") }) {
                 Text("访问 Open-Meteo")
             }
+            }  // end 高级 / 调试
 
             // ---- 赞助（收款码）：正文之后、保存之前（习惯：正文 → 赞助 → 保存）----
             // 图放 res/drawable-nodpi/：二维码不能被密度缩放重采样，糊了就扫不出来。
@@ -816,6 +930,60 @@ fun SettingsScreen(
                     TextButton(onClick = { showNeedRootDialog = false }) { Text("知道了") }
                 }
             )
+        }
+    }
+}
+
+/**
+ * 通用可折叠分组（2026-11-22 设置页瘦身）。
+ *
+ * 设置项太多，全部常驻展开要滚四五屏。这里把每一组收成「一行标题 + 摘要」，点标题展开。
+ * - 展开态用 rememberSaveable 记住（离开设置页重新进会重置，属预期；不跨会话记忆）。
+ * - 收起时标题右侧显示一行摘要（如「开 · 每日≤5条」），一眼知道当前状态。
+ * - 刻意不做失焦自动收起：内部有 OutlinedTextField，离开组合会丢光标/内部滚动。
+ */
+@Composable
+private fun CollapsibleSection(
+    title: String,
+    subtitle: String = "",
+    initiallyExpanded: Boolean = false,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    var expanded by rememberSaveable(title) { mutableStateOf(initiallyExpanded) }
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = !expanded }
+                .padding(vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.titleMedium)
+                if (subtitle.isNotBlank() && !expanded) {
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            Icon(
+                if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                contentDescription = if (expanded) "收起 $title" else "展开 $title",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        if (expanded) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), content = content)
         }
     }
 }

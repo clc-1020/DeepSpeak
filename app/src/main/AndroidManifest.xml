@@ -122,16 +122,9 @@
             </intent-filter>
         </receiver>
 
-        <!-- 通知栏常驻快捷入口（V2.3.6）：只在 MainActivity.onResume 由前台界面拉起，
-             绝不在 CompanionApp 里启动（冷启动拉 FGS 在 Android 12+ 会抛 ForegroundServiceStartNotAllowedException） -->
-        <service
-            android:name=".service.QuickAccessService"
-            android:exported="false"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="companion_quick_access" />
-        </service>
+        <!-- 通知栏常驻快捷入口（V2.3.6）：2026-11-22 起不再用前台服务，改为普通通知
+             （MIUI 会把 FGS 的 ongoing 常驻通知过滤掉，见 QuickAccessNotifier 注释）。
+             通知由 QuickAccessEntrance.sync 在 MainActivity.onResume / 设置保存时贴/撤。 -->
 
         <!-- 语音输入浮层（V2.3.6）：只在用户点常驻通知的「语音输入」时拉起 -->
         <activity

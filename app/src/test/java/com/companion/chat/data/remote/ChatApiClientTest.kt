@@ -131,4 +131,93 @@ class ChatApiClientTest {
             server.shutdown()
         }
     }
+
+    // ---- 2026-11-23：联网搜索工具 + 引用解析 ----
+
+    @Test
+    fun web_search_adds_tool_and_drops_title() = runBlocking {
+        val server = MockWebServer()
+        try {
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .addHeader("Content-Type", "text/event-stream")
+                    .setBody("data: [DONE]\n\n")
+            )
+            server.start()
+            val cfg = ApiConfig(
+                providerId = "deepseek",
+                baseUrl = server.url("/v1").toString(),
+                apiKey = "sk-test",
+                model = "deepseek-flash"
+            )
+            val opts = ChatOptions(titleEnabled = true, webSearchEnabled = true)
+            ChatApiClient().streamChat(cfg, messages, opts = opts).toList()
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue(body.contains("\"tools\":[{\"type\":\"deepseek_web_search\"}]"))
+            // 联网工具不能和 title 同传（服务端 400），必须被丢掉
+            assertTrue(!body.contains("\"title\""))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun web_search_tool_omitted_for_non_flash_model() = runBlocking {
+        val server = MockWebServer()
+        try {
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .addHeader("Content-Type", "text/event-stream")
+                    .setBody("data: [DONE]\n\n")
+            )
+            server.start()
+            val cfg = ApiConfig(
+                providerId = "deepseek",
+                baseUrl = server.url("/v1").toString(),
+                apiKey = "sk-test",
+                model = "deepseek-v4-pro"
+            )
+            ChatApiClient().streamChat(cfg, messages, opts = ChatOptions(webSearchEnabled = true)).toList()
+            val body = server.takeRequest().body.readUtf8()
+            assertTrue(!body.contains("deepseek_web_search"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun annotations_emit_citations_event() = runBlocking {
+        val server = MockWebServer()
+        try {
+            val sse =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"你好\",\"annotations\":[" +
+                    "{\"url\":\"https://a.com/x\",\"title\":\"T\",\"site_name\":\"S\"}]}}]}\n\n" +
+                    "data: [DONE]\n\n"
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .addHeader("Content-Type", "text/event-stream")
+                    .setBody(sse)
+            )
+            server.start()
+            val cfg = ApiConfig(
+                providerId = "deepseek",
+                baseUrl = server.url("/v1").toString(),
+                apiKey = "sk-test",
+                model = "deepseek-flash"
+            )
+            val events = ChatApiClient()
+                .streamChat(cfg, messages, opts = ChatOptions(webSearchEnabled = true))
+                .toList()
+            val cite = events.filterIsInstance<StreamEvent.Citations>().firstOrNull()
+            assertTrue(cite != null)
+            assertTrue(cite!!.citations.any { it.url == "https://a.com/x" })
+            assertTrue(events.any { it is StreamEvent.Delta })
+        } finally {
+            server.shutdown()
+        }
+    }
+
 }

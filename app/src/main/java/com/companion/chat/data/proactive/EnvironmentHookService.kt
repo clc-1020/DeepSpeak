@@ -1,6 +1,5 @@
 package com.companion.chat.data.proactive
 
-import com.companion.chat.data.environment.LocatedCity
 import com.companion.chat.data.environment.LocationCache
 import com.companion.chat.data.environment.WeatherBundle
 import com.companion.chat.data.environment.WeatherCache
@@ -13,7 +12,6 @@ import com.companion.chat.domain.environment.EnvironmentRuleConfig
 import com.companion.chat.domain.environment.EnvironmentRuleEngine
 import com.companion.chat.domain.proactive.PendingMessageContent
 import java.time.Instant
-import java.time.LocalDate
 import java.time.ZoneId
 
 /**
@@ -96,18 +94,27 @@ class EnvironmentHookService(
     private fun contentOf(hook: EnvironmentHook): String =
         PendingMessageContent.Environment(hook.stableId).encode()
 
-    /** 取天气 bundle。定位失败（无坐标）→ 空 bundle，此时规则引擎只返回时间类钩子。 */
+    /**
+     * 取天气 bundle。
+     *
+     * 2026-11-22：**先只读缓存**。缓存新鲜时 today/yesterday 都在里面，完全不需要坐标，
+     * 也就完全不碰定位——而定位在后台必然拿不到（Android 10+ 只给了「仅使用时」权限），
+     * 原来每小时白调一次。只有缓存缺失/过期才去取坐标并联网。
+     *
+     * 「今天」必须走**注入时钟**，不能用 `LocalDate.now()`（2026-11-21 00:0x 踩到）：
+     * 去重键 `dateKeyOf(nowMillis(), …)` 用的是注入时钟，两者一旦不一致就会出现
+     * 「天气按 21 号取、去重键按 20 号算」的错位；测试里更直接 —— 跨过午夜后
+     * 注入 11-20 10:00 却去查 11-21 的天气，假数据里没有那天 → 钩子永远为空。
+     */
     private suspend fun weatherBundle(): WeatherBundle {
-        val point = when (val city = locationCache.current()) {
-            is LocatedCity.Manual -> city.point
-            is LocatedCity.Auto -> city.point
-        }
-        // 「今天」必须走**注入时钟**，不能用 LocalDate.now()（2026-11-21 00:0x 踩到）：
-        // 去重键 `dateKeyOf(nowMillis(), …)` 用的是注入时钟，两者一旦不一致就会出现
-        // 「天气按 21 号取、去重键按 20 号算」的错位；测试里更直接 —— 跨过午夜后
-        // 注入 11-20 10:00 却去查 11-21 的天气，假数据里没有那天 → 钩子永远为空。
         val today = Instant.ofEpochMilli(nowMillis()).atZone(zone).toLocalDate()
-        return weatherCache.load(point, today)
+
+        val cached = weatherCache.peekBundle(today)
+        if (cached.today != null) return cached
+
+        // 缓存不可用 → 取坐标再联网；定位失败（无坐标）时 load 返回空 bundle，
+        // 规则引擎就只返回时间类钩子
+        return weatherCache.load(locationCache.current().point, today)
     }
 
     private fun dedupKey(hook: EnvironmentHook): String =

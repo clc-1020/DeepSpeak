@@ -15,6 +15,20 @@ interface LocationPort {
      * @return 最近一次已知位置；无权限 / provider 关闭 / 从未定位过 → null
      */
     fun lastKnown(provider: String): GeoPoint?
+
+    /**
+     * **主动**要一次当前位置（2026-11-22 新增，仅供「每天首次回到前台」使用）。
+     *
+     * 与 [lastKnown] 的区别：这里真的会向系统发起一次定位请求，能拿到比系统缓存更新的位置；
+     * 代价是要等（毫秒到几秒），所以必须带 [timeoutMs] 兜底，且**只在前台调用**——
+     * 后台请求定位在 Android 10+ 需要「始终允许」权限，本 App 刻意不申请。
+     *
+     * 默认实现退化为 [lastKnown]：这样所有既有假实现（测试）无需改动，
+     * 且任何不支持主动定位的端口都自动降级成「和以前一样」。
+     *
+     * @return 超时 / 无权限 / provider 不可用 → null（不抛）
+     */
+    suspend fun currentOnce(provider: String, timeoutMs: Long): GeoPoint? = lastKnown(provider)
 }
 
 /**

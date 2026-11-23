@@ -57,5 +57,10 @@ data class MessageEntity(
      * 该条 user 消息附带图片的本地文件路径（已拷贝到 App 私有目录），多图用换行 "\n" 拼接。
      * 仅 USER 消息可能有；展示层据此在气泡里显示图片。非 user 或纯文本消息为 null。
      */
-    val imagePaths: String? = null
+    val imagePaths: String? = null,
+    /**
+     * 联网搜索引用（2026-11-23）：仅 assistant 消息可能有，JSON 数组字符串（见 CitationCodec）。
+     * 整条回复的附属品，没有独立生命周期，所以存 JSON 不建表。null = 无引用（老消息）。
+     */
+    val citations: String? = null
 )

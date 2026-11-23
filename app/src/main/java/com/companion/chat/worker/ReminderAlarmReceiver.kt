@@ -89,6 +89,9 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
                             // 所以这里刻意不碰 ProactiveDeliveryWorker。
                             AlarmKind.TIMEOUT -> runCatching { app.followupChainRunner.tickTimeout(reminderId) }
                                 .onFailure { Log.w(TAG, "追问超时 tick 失败 id=$reminderId", it) }
+                            // 每日任务（2026-11-23）：先续排下一天，再触发后台生成+送达 Worker。
+                            // reminderId 复用来携带「任务 id」（AlarmScheduler 已把 reminderId 放进 EXTRA）。
+                            AlarmKind.DAILY_TASK -> handleDailyTask(app, context, reminderId)
                         }
                     }
                 } catch (e: Exception) {
@@ -117,6 +120,30 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
      *
      * @param reminderId 关联的 `reminders` 行 id；-1 = 没有行（环境检查/旧闹钟/落库降级），不标
      */
+    /**
+     * 每日任务到点（2026-11-23）。
+     *
+     * 顺序很重要：**先续排下一天**（若后面生成/入队出问题，至少明天的闹钟还在，不会永久停摆），
+     * 再触发 [DailyTaskWorker] 做真正的生成+送达（网络耗时，放 Worker 里，Receiver 只做快速动作）。
+     *
+     * @param taskId 任务 id（由 AlarmScheduler 放在 EXTRA_REMINDER_ID 里传来）
+     */
+    private suspend fun handleDailyTask(app: CompanionApp, context: Context, taskId: Long) {
+        if (taskId <= 0L) return
+        val task = runCatching { app.database.dailyTaskDao().getById(taskId) }.getOrNull()
+        if (task == null || !task.enabled) {
+            Log.d(TAG, "每日任务不存在或已禁用，忽略 id=$taskId")
+            return
+        }
+        // 1) 续命：排下一天（scheduleTask 内部按 now 算下一次 → 此刻已过今天这点，自然排明天）
+        runCatching { app.dailyTaskScheduler.scheduleTask(task) }
+            .onFailure { Log.w(TAG, "每日任务续排明天失败 id=$taskId", it) }
+        // 2) 触发后台生成+送达
+        runCatching { DailyTaskWorker.enqueue(context, taskId) }
+            .onFailure { Log.w(TAG, "每日任务入队失败 id=$taskId", it) }
+        Log.d(TAG, "每日任务到点，已续排并触发 worker id=$taskId")
+    }
+
     private suspend fun handleInstruction(
         app: CompanionApp,
         context: Context,
