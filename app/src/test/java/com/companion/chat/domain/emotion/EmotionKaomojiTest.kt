@@ -67,6 +67,32 @@ class EmotionKaomojiTest {
         assertEquals(0.9, EmotionKaomoji.probability(0.7), 1e-9)
     }
 
+    /** 强度分档：0.5~0.7 取温和档、≥0.7 取强烈档，两档不重叠。 */
+    @Test
+    fun picks_mild_pool_below_high_and_strong_pool_at_high() {
+        val mild = EmotionKaomoji.pool(Emotion.HAPPY, 0.6)
+        val strong = EmotionKaomoji.pool(Emotion.HAPPY, 0.85)
+        assertTrue("温和档不应为空", mild.isNotEmpty())
+        assertTrue("强烈档不应为空", strong.isNotEmpty())
+        assertTrue("两档不能重叠：$mild / $strong", mild.intersect(strong.toSet()).isEmpty())
+
+        val outMild = EmotionKaomoji.append("好呀", mapOf(Emotion.HAPPY to 0.6), alwaysHit)
+        assertTrue("0.6 应用温和档：$outMild", mild.any { outMild.endsWith(it) })
+        val outStrong = EmotionKaomoji.append("好呀", mapOf(Emotion.HAPPY to 0.85), alwaysHit)
+        assertTrue("0.85 应用强烈档：$outStrong", strong.any { outStrong.endsWith(it) })
+    }
+
+    /** 数据完整性：每种情绪温和/强烈各 3 个，全库 48 个且无重复（重名会让 strip/去重失效）。 */
+    @Test
+    fun every_emotion_has_three_per_tier_and_globally_unique() {
+        for (e in Emotion.ALL) {
+            assertEquals("$e 温和档应为 3 个", 3, EmotionKaomoji.pool(e, 0.6).size)
+            assertEquals("$e 强烈档应为 3 个", 3, EmotionKaomoji.pool(e, 0.9).size)
+        }
+        assertEquals("全库应为 8 情绪 × 6 = 48", 48, EmotionKaomoji.ALL.size)
+        assertEquals("颜文字不能有重复", EmotionKaomoji.ALL.size, EmotionKaomoji.ALL.toSet().size)
+    }
+
     @Test
     fun strip_removes_kaomoji_for_tts() {
         val spoken = EmotionKaomoji.strip("好呀 (◕‿◕)，那我等你 (´･_･`)")

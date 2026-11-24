@@ -27,7 +27,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -80,10 +79,7 @@ fun ChatScreen(
     onSettingsClick: () -> Unit,
     onDndClick: () -> Unit,
     onNewChatClick: () -> Unit,
-    onMemoryClick: () -> Unit,
     onOpenDrawer: () -> Unit,
-    /** 2026-11-23：顶栏日历入口 → 每日任务页。 */
-    onDailyTasksClick: () -> Unit = {},
     onVoiceClick: () -> Unit,
     /** V2.3.4：非空则麦克风按钮走「长按录音 → 松手识别」，为空时退回 [onVoiceClick]（无 STT 的兜底）。 */
     sttManager: SttManager? = null,
@@ -275,9 +271,7 @@ fun ChatScreen(
                 onDndClick = onDndClick,
                 dndEnabled = dndEnabled,
                 onNewChatClick = onNewChatClick,
-                onMemoryClick = onMemoryClick,
-                onOpenDrawer = onOpenDrawer,
-                onDailyTasksClick = onDailyTasksClick
+                onOpenDrawer = onOpenDrawer
             )
         },
         bottomBar = {
@@ -439,9 +433,7 @@ private fun TopBar(
     onDndClick: () -> Unit,
     dndEnabled: Boolean,
     onNewChatClick: () -> Unit,
-    onMemoryClick: () -> Unit,
-    onOpenDrawer: () -> Unit,
-    onDailyTasksClick: () -> Unit = {}
+    onOpenDrawer: () -> Unit
 ) {
     TopAppBar(
         title = {},
@@ -453,19 +445,9 @@ private fun TopBar(
                 IconButton(onClick = onSettingsClick) {
                     Icon(imageVector = Icons.Default.Settings, contentDescription = "设置")
                 }
-                // 2026-11-23：每日任务入口——简笔画风格日历，紧挨设置右边
-                IconButton(onClick = onDailyTasksClick) {
-                    Icon(imageVector = Icons.Outlined.CalendarMonth, contentDescription = "每日任务")
-                }
             }
         },
         actions = {
-            // 1.8.0：原来是「记忆」文字按钮，改成描线大脑图标（用户指定 🧠）。
-            // 用 Icons.Default.Psychology（单色，跟旁边勿扰/新建同色同尺寸），
-            // 不用彩色 emoji —— 顶栏其它图标都是单色描线，混一个彩色 emoji 会很跳。
-            IconButton(onClick = onMemoryClick) {
-                Icon(imageVector = Icons.Default.Psychology, contentDescription = "记忆")
-            }
             IconButton(onClick = onDndClick) {
                 // 开启状态必须**看得出**差别：只换 contentDescription 等于还是「点了没反应」。
                 // extended 图标已在依赖里（`filled.*` 通配导入），NotificationsOff 无需新增 import。

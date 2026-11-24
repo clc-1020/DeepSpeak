@@ -27,6 +27,8 @@ data class TtsSettings(
     val voiceId: String = "stella",
     /** 语速倍率（0.5~2.0，1.0=正常）。 */
     val speechRate: Float = 1.0f,
+    /** 是否用小爱同学当前的音色（需手机装 Xposed 桥模块，见[xiaoaiEnabled]说明）。 */
+    val xiaomiEnabled: Boolean = false,
     /** 系统 TTS 引擎包名；null=系统默认引擎。 */
     val systemEngine: String? = null
 )

@@ -78,10 +78,18 @@ object CitationParser {
         annotations.asJsonArray.forEach { el ->
             if (el != null && el.isJsonObject) {
                 val obj = el.asJsonObject
-                val url = obj.get("url")?.takeIf { it.isJsonPrimitive }?.asString
+                // 服务端为 Chat Completions 流式的**嵌套结构**（2026-11-23 真机实测）：
+                //   {"type":"url_citation","url_citation":{"url","title","start_index","end_index"}}
+                // 兼容两种形状：优先取 `url_citation` 子对象，取不到再回退到扁平对象本身。
+                val inner = obj.get("url_citation")?.takeIf { it.isJsonObject }?.asJsonObject
+                val src = inner ?: obj
+                val url = (src.get("url") ?: obj.get("url"))
+                    ?.takeIf { it.isJsonPrimitive }?.asString
                 if (!url.isNullOrBlank()) {
-                    val title = obj.get("title")?.takeIf { it.isJsonPrimitive }?.asString
-                    val site = obj.get("site_name")?.takeIf { it.isJsonPrimitive }?.asString
+                    val title = (src.get("title") ?: obj.get("title"))
+                        ?.takeIf { it.isJsonPrimitive }?.asString
+                    val site = (src.get("site_name") ?: obj.get("site_name"))
+                        ?.takeIf { it.isJsonPrimitive }?.asString
                     out.add(Citation(url = url, title = title, siteName = site))
                 }
             }

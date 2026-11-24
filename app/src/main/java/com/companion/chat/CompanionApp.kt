@@ -76,6 +76,7 @@ import com.companion.chat.data.tts.ReadAloudController
 import com.companion.chat.data.tts.SystemTtsEngine
 import com.companion.chat.data.tts.TtsManager
 import com.companion.chat.data.tts.TtsSettings
+import com.companion.chat.data.tts.XiaoaiTtsEngine
 import com.companion.chat.domain.environment.EnvironmentHooks
 import com.companion.chat.domain.environment.EnvironmentRuleEngine
 import com.companion.chat.domain.work.WorkScheduleHealth
@@ -183,11 +184,17 @@ class CompanionApp : Application() {
             voiceProvider = { configRepository.load().ttsVoice },
             cacheDirProvider = { cacheDir }
         )
+        // 1.13.0：小爱音色通道（依赖手机上的 Xposed 桥模块，见 samples/xposed_probe）
+        val xiaoai = XiaoaiTtsEngine(
+            context = this,
+            speechRateProvider = { configRepository.getTtsSpeechRate() }
+        )
         TtsManager(
             settingsProvider = {
                 val c = configRepository.load()
                 TtsSettings(
                     enabled = configRepository.getTtsEnabled(),
+                    xiaomiEnabled = configRepository.getXiaoaiTtsEnabled(),
                     deepSeekEnabled = c.deepSeekTtsEnabled,
                     voiceId = c.ttsVoice,
                     speechRate = configRepository.getTtsSpeechRate(),
@@ -195,7 +202,14 @@ class CompanionApp : Application() {
                 )
             },
             systemEngine = system,
-            deepSeekEngine = deepSeek
+            deepSeekEngine = deepSeek,
+            xiaoaiEngine = xiaoai,
+            // 1.13.1：全部通道都失败时弹一句可读提示。之前是静默失败（点喇叭没声音、也没告诉他为什么）。
+            errorSink = { msg ->
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
         )
     }
 

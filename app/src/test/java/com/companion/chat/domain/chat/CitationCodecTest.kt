@@ -70,4 +70,31 @@ class CitationCodecTest {
         assertEquals(0, CitationParser.parse(null).size)
         assertEquals(0, CitationParser.parse(JsonParser.parseString("{\"a\":1}")).size)
     }
+
+    @Test
+    fun parser_extracts_from_nested_url_citation() {
+        // 真实 Chat Completions 流式结构（2026-11-23 真机实测）：url/title 嵌在 url_citation 里
+        val json = JsonParser.parseString(
+            "[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://x.com/1\",\"title\":\"T1\",\"start_index\":0,\"end_index\":10}}," +
+                "{\"type\":\"url_citation\",\"url_citation\":{\"title\":\"no-url\"}}]"
+        )
+        val cites = CitationParser.parse(json)
+        assertEquals(1, cites.size)
+        assertEquals("https://x.com/1", cites[0].url)
+        assertEquals("T1", cites[0].title)
+    }
+
+    @Test
+    fun parser_handles_mixed_nested_and_flat() {
+        val json = JsonParser.parseString(
+            "[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://n.com\",\"title\":\"N\"}}," +
+                "{\"type\":\"web_search_result_location\",\"url\":\"https://f.com\",\"title\":\"F\",\"site_name\":\"FS\"}]"
+        )
+        val cites = CitationParser.parse(json)
+        assertEquals(2, cites.size)
+        assertEquals("https://n.com", cites[0].url)
+        assertEquals("N", cites[0].title)
+        assertEquals("https://f.com", cites[1].url)
+        assertEquals("FS", cites[1].siteName)
+    }
 }

@@ -194,6 +194,8 @@ fun MainScreen(
                     thinkingEnabled = c.thinkingEnabled,
                     deepSeekTtsEnabled = c.deepSeekTtsEnabled,
                     ttsVoice = c.ttsVoice,
+                    // 1.13.0：小爱音色通道（默认关）
+                    xiaomiTtsEnabled = app.configRepository.getXiaoaiTtsEnabled(),
                     ttsEnabled = app.configRepository.getTtsEnabled(),
                     ttsSpeechRate = app.configRepository.getTtsSpeechRate(),
                     ttsSystemEngine = app.configRepository.getTtsSystemEngine(),
@@ -280,6 +282,8 @@ fun MainScreen(
                 app.configRepository.setTtsEnabled(form.ttsEnabled)
                 app.configRepository.setTtsSpeechRate(form.ttsSpeechRate)
                 app.configRepository.setTtsSystemEngine(form.ttsSystemEngine)
+                // 1.13.0：小爱音色通道开关（漏了它 → 点了不生效，重启又变回关）
+                app.configRepository.setXiaoaiTtsEnabled(form.xiaomiTtsEnabled)
                 // V2.3.5：语音输入开关；persist 漏了它 → 点了不生效（重启又变回开）
                 app.configRepository.setSttEnabled(form.sttEnabled)
                 // V2.3.6：保存后当场同步常驻入口，关掉即撤通知，不等下次进前台
@@ -396,6 +400,15 @@ fun MainScreen(
                         onNewChat = {
                             vm.newChat()
                             scope.launch { drawerState.close() }
+                        },
+                        onRename = { id, title -> vm.renameConversation(id, title) },
+                        onOpenDailyTasks = {
+                            screen = "daily_tasks"
+                            scope.launch { drawerState.close() }
+                        },
+                        onMemoryClick = {
+                            screen = "memory"
+                            scope.launch { drawerState.close() }
                         }
                     )
                 }
@@ -424,8 +437,6 @@ fun MainScreen(
                         Toast.makeText(context, plan.toast, Toast.LENGTH_SHORT).show()
                     },
                     onNewChatClick = { vm.newChat() },
-                    onMemoryClick = { screen = "memory" },
-                    onDailyTasksClick = { screen = "daily_tasks" },
                     onOpenDrawer = { scope.launch { drawerState.open() } },
                     // V2.3.4：语音输入在 ChatScreen 内部（长按录音 → 松手识别），
                     // onVoiceClick 仅作为 sttManager 缺失时的兜底入口，这里不再放逻辑

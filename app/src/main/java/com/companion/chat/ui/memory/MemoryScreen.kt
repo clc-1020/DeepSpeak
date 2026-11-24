@@ -1,8 +1,13 @@
 package com.companion.chat.ui.memory
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
@@ -12,6 +17,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -29,7 +35,23 @@ private val dateFmt = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
 private fun fmtDateTime(ts: Long): String = dateTimeFmt.format(Date(ts))
 private fun today(): String = dateFmt.format(Date())
 
-/** 记忆管理界面（短期 / 长期 / 日记）。任务 2.7（UI） */
+/**
+ * 记忆正文清理：日记/部分记忆把内容存成了 JSON 数组字符串（形如 `["...","..."]`），
+ * 直接显示会露出 `[" ]` 原始括号很丑。这里把数组拆成多行纯文本；非数组原样返回。
+ */
+private fun prettyMemory(raw: String): String {
+    val t = raw.trim()
+    if (t.length >= 2 && t.startsWith("[") && t.endsWith("]")) {
+        return runCatching {
+            val arr = org.json.JSONArray(t)
+            if (arr.length() == 0) t
+            else (0 until arr.length()).joinToString("\n") { arr.optString(it) }
+        }.getOrDefault(t)
+    }
+    return t
+}
+
+/** 记忆管理界面（短期 / 长期 / 日记）。任务 2.7（UI）；2026-11-23 改成行式列表。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MemoryScreen(
@@ -60,16 +82,12 @@ fun MemoryScreen(
                         Icon(Icons.Default.ArrowBack, contentDescription = "返回")
                     }
                 },
-                // 1.8.0：顶栏与聊天区同色（深色下 = #0F0F0F），保持"一片黑"
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface
                 )
             )
         },
         floatingActionButton = {
-            // 1.8.2：默认 primaryContainer（深紫圆钮）→ accent 暗铺底 + accent 图标（方案 B）。
-            // 一整颗 #7797EC 亮蓝在纯黑页面上太抢眼，暗铺底更像"操作位"而不是"警报灯"。
-            // 1.9.0：改走色板，浅色自动换成 #E8EFFE 底 + #2F63D8 图标。
             val palette = LocalChatColors.current
             FloatingActionButton(
                 onClick = {
@@ -163,12 +181,12 @@ private fun ShortList(
 ) {
     if (items.isEmpty()) { EmptyHint("还没有短期记忆"); return }
     LazyColumn(
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         items(items) { item ->
-            MemoryCard(
-                title = item.content,
+            MemoryRow(
+                title = prettyMemory(item.content),
                 subtitle = "${fmtDateTime(item.timestamp)} · 权重 %.1f · 淡忘 %.1f".format(item.weight, item.fadeScore),
                 onEdit = { onEdit(item) },
                 onDelete = { onDelete(item) }
@@ -185,12 +203,12 @@ private fun LongList(
 ) {
     if (items.isEmpty()) { EmptyHint("还没有长期记忆"); return }
     LazyColumn(
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         items(items) { item ->
-            MemoryCard(
-                title = item.content,
+            MemoryRow(
+                title = prettyMemory(item.content),
                 subtitle = "[${item.category}] ${fmtDateTime(item.createTime)}",
                 onEdit = { onEdit(item) },
                 onDelete = { onDelete(item) }
@@ -207,12 +225,12 @@ private fun DailyList(
 ) {
     if (items.isEmpty()) { EmptyHint("还没有日记"); return }
     LazyColumn(
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         items(items) { item ->
-            MemoryCard(
-                title = item.events.ifBlank { "（空）" },
+            MemoryRow(
+                title = prettyMemory(item.events).ifBlank { "（空）" },
                 subtitle = item.date,
                 onEdit = { onEdit(item) },
                 onDelete = { onDelete(item) }
@@ -221,25 +239,62 @@ private fun DailyList(
     }
 }
 
+/**
+ * 记忆行（2026-11-23 按 DeepSeek 行式重做）：
+ * 去掉厚重灰卡片，改成扁平行——正文 2 行 + 小灰字副信息 + 右侧两个小号操作图标。
+ * 点一下整行：淡蓝胶囊高亮 + 细边框，图标转为 accent 色（提示"这行被选中了"）。
+ */
 @Composable
-private fun MemoryCard(
+private fun MemoryRow(
     title: String,
     subtitle: String,
     onEdit: () -> Unit,
     onDelete: () -> Unit
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(title, fontSize = 15.sp, maxLines = 4, overflow = TextOverflow.Ellipsis)
+    val palette = LocalChatColors.current
+    var selected by remember { mutableStateOf(false) }
+    val shape = RoundedCornerShape(12.dp)
+    val bg = if (selected) palette.accentSurface
+    else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.035f)
+    val iconTint = if (selected) palette.accentText else MaterialTheme.colorScheme.onSurfaceVariant
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(bg)
+            .then(
+                if (selected) Modifier.border(1.dp, palette.accentText.copy(alpha = 0.45f), shape)
+                else Modifier
+            )
+            .clickable { selected = !selected }
+            .padding(start = 14.dp, end = 4.dp, top = 12.dp, bottom = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, fontSize = 15.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            if (subtitle.isNotBlank()) {
                 Spacer(Modifier.height(4.dp))
                 Text(subtitle, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            IconButton(onClick = onEdit) { Icon(Icons.Default.Edit, contentDescription = "编辑") }
-            IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, contentDescription = "删除") }
+        }
+        Spacer(Modifier.width(6.dp))
+        Box(
+            modifier = Modifier
+                .size(34.dp)
+                .clip(CircleShape)
+                .clickable(onClick = onEdit),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(Icons.Default.Edit, contentDescription = "编辑", tint = iconTint, modifier = Modifier.size(18.dp))
+        }
+        Box(
+            modifier = Modifier
+                .size(34.dp)
+                .clip(CircleShape)
+                .clickable(onClick = onDelete),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(Icons.Default.Delete, contentDescription = "删除", tint = iconTint, modifier = Modifier.size(18.dp))
         }
     }
 }

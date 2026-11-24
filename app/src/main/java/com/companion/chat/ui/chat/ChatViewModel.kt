@@ -292,6 +292,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** 重命名会话（会话列表 ✎ 用）。空标题忽略；DB 变化后 summaries 自动刷新。 */
+    fun renameConversation(id: Long, title: String) {
+        val t = title.trim()
+        if (t.isEmpty()) return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                conversationDao.updateTitle(id, t)
+            }
+        }
+    }
+
     /** 把某会话的历史加载到 UI 状态（switchTo / deleteConversation 复用）。任务 1.8 */
     private suspend fun loadConversationIntoUi(id: Long, bindToMode: Boolean = true) {
         val history = messageDao.getByConversation(id)

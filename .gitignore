@@ -83,3 +83,9 @@ hs_err_pid*.log
 
 # 节日生成器的编译产物
 /tools/genfestivals/out/
+
+# ===== 逆向样本与调试产物（2026-11-24 加）=====
+# samples/ 含数据库快照 db129.db、签名密钥 probe.keystore、第三方 APK、Frida/逆向脚本，绝不进公开仓库
+/samples/
+# 调试临时产物（logcat 截图、uiautomator dump）
+.diag_*

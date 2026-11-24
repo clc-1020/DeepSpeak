@@ -120,6 +120,14 @@ class ConfigRepository(context: Context) {
     fun getTtsSystemEngine(): String? = prefs.getString(KEY_TTS_SYSTEM_ENGINE, null)
     fun setTtsSystemEngine(name: String?) = prefs.edit().putString(KEY_TTS_SYSTEM_ENGINE, name).apply()
 
+    /**
+     * 小爱同学音色通道（默认关）。
+     * 开启后朗读优先走小爱当前音色（需手机装 Xposed 桥模块 com.companion.xposedprobe）。
+     */
+    fun getXiaoaiTtsEnabled(): Boolean = prefs.getBoolean(KEY_XIAOAI_TTS_ENABLED, false)
+    fun setXiaoaiTtsEnabled(enabled: Boolean) =
+        prefs.edit().putBoolean(KEY_XIAOAI_TTS_ENABLED, enabled).apply()
+
     // ---------- 语音输入（STT）设置。任务 V2.3.5 ----------
 
     /**
@@ -311,6 +319,7 @@ class ConfigRepository(context: Context) {
         private const val KEY_CHAT_MODE = "chat_mode"
         private const val KEY_TTS_SPEECH_RATE = "tts_speech_rate"
         private const val KEY_TTS_SYSTEM_ENGINE = "tts_system_engine"
+    private const val KEY_XIAOAI_TTS_ENABLED = "xiaoai_tts_enabled"
         private const val KEY_PROACTIVE_VOICE = "proactive_voice_enabled"
         private const val KEY_DND_ENABLED = "dnd_enabled"
         private const val KEY_DND_START_MINUTE = "dnd_start_minute"

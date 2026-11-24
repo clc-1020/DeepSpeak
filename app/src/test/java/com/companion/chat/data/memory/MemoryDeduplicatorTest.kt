@@ -76,13 +76,17 @@ class MemoryDeduplicatorTest {
     private val A2 = "明天去公司面试"
     private val B = "我喜欢猫"
     private val C082 = "用户说糖水店的绿豆汤不错" // 与 A 余弦≈0.82
+    private val D0755 = "用户希望获取 DeepSeek 官方最新公告的内容" // 与 A 余弦≈0.755（真机样本）
+    private val E070 = "用户随口提了个相近的话题" // 与 A 余弦≈0.70（构造边界）
 
     private val emb = FakeEmb(
         mapOf(
             A to floatArrayOf(1f, 0f, 0f),
             A2 to floatArrayOf(0.98f, 0.12f, 0f), // 与 A 余弦 ≈0.99 > 0.85
             B to floatArrayOf(0f, 1f, 0f),         // 与 A 正交 ≈0
-            C082 to floatArrayOf(0.82f, 0.5724f, 0f) // 与 A 余弦 ≈0.82（<0.85 但 >0.80）
+            C082 to floatArrayOf(0.82f, 0.5724f, 0f), // 与 A 余弦 ≈0.82（<0.85 但 >0.75）
+            D0755 to floatArrayOf(0.755f, 0.6557f, 0f), // 与 A 余弦 ≈0.755（旧 0.80 漏并，新 0.75 应并）
+            E070 to floatArrayOf(0.70f, 0.7141f, 0f)     // 与 A 余弦 ≈0.70（新阈值 0.75 仍不并）
         )
     )
 
@@ -163,7 +167,7 @@ class MemoryDeduplicatorTest {
 
     @Test
     fun long_merges_at_lower_threshold_than_short() = runBlocking {
-        // 余弦 0.82：短记忆阈值 0.85 不合并；长期阈值 0.80 合并（修真机 0.84 同义不并）
+        // 余弦 0.82：短记忆阈值 0.85 不合并；长期阈值 0.75 合并
         val s = FakeShort(); val l = FakeLong()
         val d = dedup(s, l)
         assertEquals(1, d.upsertShort(A))
@@ -173,6 +177,26 @@ class MemoryDeduplicatorTest {
         assertEquals(1, d.upsertLong(A, "fact"))
         assertEquals(0, d.upsertLong(C082, "preference"))
         assertEquals(1, l.items.size)
+    }
+
+    @Test
+    fun long_merges_at_075_below_old_080_threshold() = runBlocking {
+        // 真机样本：两条 DeepSeek 记忆余弦≈0.755，旧阈值 0.80 漏并；现默认 0.75 应合并
+        val s = FakeShort(); val l = FakeLong()
+        val d = dedup(s, l)
+        assertEquals(1, d.upsertLong(A, "other"))
+        assertEquals(0, d.upsertLong(D0755, "preference"))
+        assertEquals(1, l.items.size)
+    }
+
+    @Test
+    fun long_does_not_merge_below_075() = runBlocking {
+        // 余弦≈0.70 < 0.75 → 仍应是两条，别为压重复而过度合并
+        val s = FakeShort(); val l = FakeLong()
+        val d = dedup(s, l)
+        assertEquals(1, d.upsertLong(A, "other"))
+        assertEquals(1, d.upsertLong(E070, "preference"))
+        assertEquals(2, l.items.size)
     }
 
     @Test

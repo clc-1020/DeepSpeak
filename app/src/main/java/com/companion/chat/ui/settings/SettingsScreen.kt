@@ -70,6 +70,8 @@ data class SettingsForm(
     val thinkingEnabled: Boolean = false,
     val deepSeekTtsEnabled: Boolean = false,
     val ttsVoice: String = "stella",
+    // 1.13.0：小爱音色通道（需 Xposed 桥模块）；默认关，与 ConfigRepository 一致
+    val xiaomiTtsEnabled: Boolean = false,
     // 语音总开关 / 语速 / 系统引擎（任务 4.1）
     val ttsEnabled: Boolean = true,
     val ttsSpeechRate: Float = 1.0f,
@@ -408,6 +410,19 @@ fun SettingsScreen(
                 initiallyExpanded = true
             ) {
 
+            // 1.13.0：小爱音色通道。放在「官方语音」之前，因为它的优先级最高（本机音色、不走网络）。
+            SwitchRow("小爱同学音色（需 Xposed 模块）", form.xiaomiTtsEnabled) {
+                form = form.copy(xiaomiTtsEnabled = it)
+            }
+            if (form.xiaomiTtsEnabled) {
+                Text(
+                    "用小爱当前选中的音色朗读（含「由他人分享」的第三方音色，如洛琪希）。" +
+                        "需要手机安装并启用 com.companion.xposedprobe 模块；未装或失败会自动回退到下一条通道。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
             SwitchRow("官方语音（联网计费）", form.deepSeekTtsEnabled) {
                 form = form.copy(deepSeekTtsEnabled = it)
             }
@@ -455,7 +470,7 @@ fun SettingsScreen(
                 val engines = remember { TtsEngineCatalog.available(context) }
                 if (engines.isEmpty()) {
                     Text(
-                        "未检测到系统语音引擎，请安装「Google 文字转语音」等引擎（当前仅能用官方语音）",
+                        "未检测到系统语音引擎。可以开启上面的「小爱同学音色」，或安装一个 TTS 引擎（如「Google 文字转语音」）；两者都没有时朗读会没有声音。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error
                     )
