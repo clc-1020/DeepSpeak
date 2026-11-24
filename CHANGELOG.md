@@ -9,6 +9,30 @@
 
 ---
 
+## [1.13.3] - 2026-11-24 · versionCode 90
+
+**测试基线：1160 / 133 suite / 0 失败**（新增 2 条：`ProactiveChannelPolicyTest`，钉住「指令提醒走独立渠道」）
+
+### 修复（定时提醒没了弹窗通知）
+- **「定时提醒」现在用独立的「定时提醒」通知渠道，不再和闲聊主动消息共用渠道**。此前两者都走 `proactive_message`：在 MIUI/HyperOS 上从通知栏「关闭」只关**当前渠道**（importance→NONE），用户为屏蔽闲聊而关掉它时，**自己设的定时提醒也跟着不弹**（表现为「有声音、没弹窗、也不报错」）。
+- 修复：指令提醒（`ProactiveMessageCategory.INSTRUCTION`）改走全新高优先级渠道 `reminder`（`IMPORTANCE_HIGH` + `CATEGORY_ALARM`）；该渠道对老用户是新建、默认 HIGH，装上即可弹。闲聊/节日/环境/追问等仍在 `proactive_message`。
+- 附带：渠道被系统关成 NONE 时打一条 `ProactiveNotify` 日志，便于排查「为什么不弹」而不是彻底静默。
+- 纯逻辑抽取 `ProactiveChannelPolicy.usesReminderChannel()` 并单测。
+
+---
+
+## [1.13.2] - 2026-11-24 · versionCode 89
+
+**测试基线：1158 / 132 suite / 0 失败**（新增 3 条：`LlmProactiveMessageGeneratorRecentContextTest`，钉住「提醒/追问不叠加最近对话上下文」）
+
+### 修复（定时提醒念成了另一段对话的内容）
+- **到点的「定时提醒」不再被念成你最近那段对话的内容**。之前用户刚在对话 A 里聊过、再让她「到点提醒我××」，提醒触发时会把 **A 最近的 3 条消息当成上下文**喂给模型，生成出来的提醒变成 A 的延续——播报/通知出来的是 A 的内容，而不是提醒本身。
+- 根因：`LlmProactiveMessageGenerator.recentMessages()` 无条件取 `conversationDao.getAll().firstOrNull()`（按 `lastMessageTime` 排序的**最近活跃会话**），与这条提醒属于哪段对话无关。
+- 修复：指令提醒（`Instruction`）与追问（`Followup`）是点状事件、自带明确话题，**不再叠加「最近对话」上下文**；记忆/长期记忆/纯文本闲聊/环境/节日仍保留（用于自然衔接与去重）。
+- 说明：**每日任务（日历「语音输出」）不受影响**——它走 `DailyTaskRunner`，回复只由任务原文生成，不读任何会话历史；本次修复的是「在聊天里让她设的定时提醒」。
+
+---
+
 ## [1.13.1] - 2026-11-24 · versionCode 88
 
 **测试基线：1155 / 131 suite / 0 失败**（新增 3 条：全部通道失败时的提示文案 / 保留底层原因 / 成功不报错）

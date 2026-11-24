@@ -21,7 +21,13 @@ data class ProactiveNotification(
      * 追问链的提醒 id（V2.2.5，计划书 §3.9）：非空时通知挂「已完成」「再等等」两个按钮。
      * 非追问消息恒为 null —— 不要给它默认值以外的语义。
      */
-    val followupReminderId: Long? = null
+    val followupReminderId: Long? = null,
+    /**
+     * 消息类别（1.13.3）。通知实现据此选择**渠道**与 `category`：
+     * 指令提醒（[ProactiveMessageCategory.INSTRUCTION]）走独立高优先级「定时提醒」渠道 + `CATEGORY_ALARM`，
+     * 与闲聊主动消息的 `proactive_message` 解耦 —— 避免用户静音闲聊时，把自己设的定时提醒一起静音。
+     */
+    val category: ProactiveMessageCategory = ProactiveMessageCategory.SPONTANEOUS
 )
 
 /** 通知展示端口（Android 实现见 AndroidProactiveNotifier）。任务 3.5 */

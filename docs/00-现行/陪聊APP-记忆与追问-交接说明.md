@@ -363,6 +363,8 @@ MemoryContextBlockTest(13) / MemoryContextProviderTest(6) / QuickDndTest(9)
 8. **`private class` 的 fake 不能继承**（Kotlin class 默认 final）：测试里要给 fake 加行为，用**接口委托**（`class X : Dao by base`）而不是继承。
 9. **跨午夜会翻红一批测试**：任何「今天」的取值必须与注入时钟同源。
 10. **写作 fake 的自动补丁要核对类边界**：批量替换 `deleteAll() { items.clear() }` 会同时命中 `FakeLong`/`FakeDaily`，插进了不属于它们的接口方法。
+11. **主动消息生成别拿「最近活跃会话」当提醒的上下文**（1.13.2 真机 bug）：`LlmProactiveMessageGenerator.recentMessages()` 原无条件取 `conversationDao.getAll().firstOrNull()`（按 `lastMessageTime` 的最近会话）。用户刚在对话 A 聊过、再让她「到点提醒」，提醒会带 A 的最近 3 条去生成 → 播报/通知出来是 A 的内容而不是提醒本身。已改为：指令提醒/追问**不叠加**最近对话（`shouldIncludeRecentContext`）；记忆/环境/节日/闲聊仍保留。每日任务走 `DailyTaskRunner`，回复只由任务原文生成，不受影响。
+12. **指令提醒别和闲聊主动消息共用通知渠道**（1.13.3 真机 bug）：两者原先都走 `proactive_message`。MIUI/HyperOS 从通知栏「关闭」只关**当前渠道**（importance→NONE，`areNotificationsEnabled()` 仍 true），用户顺手划掉/关闭闲聊通知 = 该渠道被关 = **自己设的定时提醒一起不弹**（`notify()` 静默丢弃，连异常都没有）。已拆开：指令提醒用独立 `reminder` 渠道（HIGH + CATEGORY_ALARM），见 `ProactiveChannelPolicy`。判断"通知真能不能弹"必须 App 级 && 渠道级（`SystemPermissions.notificationsDeliverable(channel)`），别只信 `areNotificationsEnabled()`。
 
 ---
 

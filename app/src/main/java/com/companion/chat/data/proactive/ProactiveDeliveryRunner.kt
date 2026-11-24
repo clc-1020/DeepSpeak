@@ -177,7 +177,9 @@ class ProactiveDeliveryRunner(
                 dismissLongMemoryId = PendingMessageContent.longMemoryIdOrNull(msg.content),
                 // V2.2.5：追问消息把 reminderId 带到通知上供按钮回执使用。
                 // 用现成的 followupOrNull（= decode(...) as? Followup），非追问恒 null。
-                followupReminderId = PendingMessageContent.followupOrNull(msg.content)?.reminderId
+                followupReminderId = PendingMessageContent.followupOrNull(msg.content)?.reminderId,
+                // 1.13.3：带上类别，供通知实现选渠道（指令提醒走独立高优先级「定时提醒」渠道）。
+                category = category
             )
         )
         // **只有真实投递才计入「今日已发」计数**（任务 7.1 上限依据）。

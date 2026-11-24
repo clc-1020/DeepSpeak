@@ -42,8 +42,9 @@ class LlmProactiveMessageGenerator(
     override suspend fun generate(pending: PendingMessageEntity): String? {
         val cfg = configProvider()
         if (cfg.apiKey.isBlank()) return null
+        val content = PendingMessageContent.decode(pending.content)
         val hook = resolveHookText(pending) ?: return null
-        val recent = recentMessages()
+        val recent = recentMessagesFor(content)
         val persona = personaProvider()
         // 任务 5.2：当前 mood 写进 system（语气调整），未知/异常一律回落 normal
         val mood = runCatching { moodProvider() }.getOrNull()
@@ -88,10 +89,31 @@ class LlmProactiveMessageGenerator(
                     "不要重复原话、不要说教、不要提「第几次」也不要提「又在催」"
         }
 
-    private suspend fun recentMessages() = try {
-        val convId = conversationDao.getAll().firstOrNull()?.id
-        if (convId == null) emptyList() else messageDao.getRecent(convId, recentLimit)
+    private suspend fun recentMessagesFor(content: PendingMessageContent) = try {
+        // 修复（1.13.2）「定时提醒念成另一段对话的内容」：
+        // 指令提醒 / 追问是**点状**提醒，自身已带明确话题（hook），不能再叠加「最近活跃会话」的历史。
+        // 之前无条件取 conversationDao.getAll().firstOrNull()（按 lastMessageTime 排序的最近会话），
+        // 当用户刚在另一段对话 A 里聊过、A 成为最近活跃会话时，提醒会被模型写成 A 的延续 ——
+        // 实测表现为「到点播报/通知出来的不是提醒本身，而是 A 对话的内容」。
+        if (!shouldIncludeRecentContext(content)) {
+            emptyList()
+        } else {
+            val convId = conversationDao.getAll().firstOrNull()?.id
+            if (convId == null) emptyList() else messageDao.getRecent(convId, recentLimit)
+        }
     } catch (_: Exception) {
         emptyList()
+    }
+
+    companion object {
+        /**
+         * 是否给该类型消息叠加「最近对话」上下文（纯函数，可 JVM 单测）。
+         *
+         * 指令提醒 / 追问自带明确话题、且是独立事件，**不叠加**，避免被无关的最近会话带跑。
+         * 其余（记忆话题 / 长期记忆 / 纯文本闲聊 / 环境 / 节日）保留上下文，用于自然衔接与去重。
+         */
+        internal fun shouldIncludeRecentContext(content: PendingMessageContent): Boolean =
+            content !is PendingMessageContent.Instruction &&
+                content !is PendingMessageContent.Followup
     }
 }

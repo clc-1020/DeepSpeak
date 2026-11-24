@@ -11,6 +11,7 @@ import com.companion.chat.R
 import com.companion.chat.domain.proactive.NotificationActionKind
 import com.companion.chat.domain.proactive.NotificationActions
 import com.companion.chat.domain.proactive.ProactiveNotification
+import com.companion.chat.domain.proactive.ProactiveChannelPolicy
 import com.companion.chat.domain.proactive.ProactiveNotifier
 import com.companion.chat.ui.MainActivity
 import com.companion.chat.worker.ReminderDoneReceiver
@@ -24,7 +25,23 @@ import com.companion.chat.worker.ReminderDoneReceiver
 class AndroidProactiveNotifier(private val context: Context) : ProactiveNotifier {
 
     override fun show(notification: ProactiveNotification) {
-        ensureChannel()
+        // 1.13.3：指令提醒走**独立**高优先级「定时提醒」渠道 + CATEGORY_ALARM，
+        // 与闲聊主动消息的 proactive_message 解耦 —— 用户静音闲聊时，自己设的定时提醒照样弹。
+        // （此前两者共用 proactive_message：MIUI 上把闲聊通知划掉=该渠道被关=NONE，
+        //   连用户自己设的定时提醒也一起不弹，就是这次「定时任务没有弹窗」的根因。）
+        val isReminder = ProactiveChannelPolicy.usesReminderChannel(notification.category)
+        val channelId = if (isReminder) REMINDER_CHANNEL_ID else CHANNEL_ID
+        ensureChannel(channelId)
+        // 渠道被系统关成 NONE 时，notify() 不报错、静默丢弃 —— 打一条日志便于排查。
+        runCatching {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (nm.getNotificationChannel(channelId)?.importance == NotificationManager.IMPORTANCE_NONE) {
+                android.util.Log.w(
+                    "ProactiveNotify",
+                    "通知渠道 $channelId 已被系统关闭，提醒不会弹出（去系统设置重新开启该渠道）"
+                )
+            }
+        }
         val tapIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
             notification.conversationId?.let { putExtra(EXTRA_CONVERSATION_ID, it) }
@@ -35,13 +52,16 @@ class AndroidProactiveNotifier(private val context: Context) : ProactiveNotifier
             tapIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, channelId)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(notification.title)
             .setContentText(notification.body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(notification.body))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setCategory(
+                if (isReminder) NotificationCompat.CATEGORY_ALARM
+                else NotificationCompat.CATEGORY_MESSAGE
+            )
             .setAutoCancel(true)
             .setContentIntent(tapPi)
         // 任务 3.7 + V2.2.5：按钮构成由 domain 的纯函数决定，这里只负责渲染。
@@ -110,22 +130,31 @@ class AndroidProactiveNotifier(private val context: Context) : ProactiveNotifier
         NotificationActionKind.DISMISS -> NotificationActions.ACTION_DISMISS
     }
 
-    private fun ensureChannel() {
+    private fun ensureChannel(channelId: String) {
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (nm.getNotificationChannel(CHANNEL_ID) != null) return
+        if (nm.getNotificationChannel(channelId) != null) return
+        val (name, desc) = when (channelId) {
+            REMINDER_CHANNEL_ID -> "定时提醒" to "你设定的定时提醒（到点必响）"
+            else -> "主动消息" to "陪你聊天主动发来的消息"
+        }
         val channel = NotificationChannel(
-            CHANNEL_ID,
-            "主动消息",
+            channelId,
+            name,
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "陪你聊天主动发来的消息"
+            description = desc
             enableVibration(true)
         }
         nm.createNotificationChannel(channel)
     }
 
     companion object {
+        /** 闲聊主动消息渠道（保持原名，避免已有关闭状态失效）。 */
         const val CHANNEL_ID = "proactive_message"
+
+        /** 指令提醒独立渠道（1.13.3）：全新 HIGH 渠道，不受「主动消息」被静音影响。 */
+        const val REMINDER_CHANNEL_ID = "reminder"
+
         const val EXTRA_CONVERSATION_ID = "extra_conversation_id"
         private const val ACTION_PREFIX = "com.companion.chat.action.REMINDER_"
     }
